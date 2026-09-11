@@ -11,12 +11,17 @@ class DatasetRepository(Protocol):
 class JobRepository(Protocol):
     def add(self, job: Job) -> Job: ...
     def get(self, job_id: int) -> Job | None: ...
+    def update(self, job: Job) -> None: ...
     def list(
         self, dataset_id: int | None = None, status: JobStatus | None = None
     ) -> list[Job]: ...
 
 
 class DatasetNotFoundError(Exception):
+    pass
+
+
+class JobNotFoundError(Exception):
     pass
 
 
@@ -57,3 +62,15 @@ class FilterJobService:
         self, dataset_id: int | None = None, status: JobStatus | None = None
     ) -> list[Job]:
         return self._jobs.list(dataset_id=dataset_id, status=status)
+
+    def get_job_status(self, job_id: int) -> Job:
+        job = self._jobs.get(job_id)
+        if job is None:
+            raise JobNotFoundError(f"job {job_id} not found")
+        return job
+
+    def cancel_job(self, job_id: int) -> Job:
+        job = self.get_job_status(job_id)
+        job.cancel()
+        self._jobs.update(job)
+        return job

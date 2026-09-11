@@ -4,9 +4,10 @@ from giecar_seismic.application.filter_jobs import (
     DatasetNotFoundError,
     FilterJobService,
     InvalidFilterParametersError,
+    JobNotFoundError,
 )
 from giecar_seismic.domain.dataset import SeismicDataset
-from giecar_seismic.domain.job import Job, JobStatus
+from giecar_seismic.domain.job import InvalidTransitionError, Job, JobStatus
 
 
 class FakeDatasetRepository:
@@ -30,6 +31,10 @@ class FakeJobRepository:
 
     def get(self, job_id: int) -> Job | None:
         return self._jobs.get(job_id)
+
+    def update(self, job: Job) -> None:
+        assert job.id is not None
+        self._jobs[job.id] = job
 
     def list(
         self, dataset_id: int | None = None, status: JobStatus | None = None
@@ -105,3 +110,39 @@ def test_create_filter_job_does_not_persist_job_on_validation_failure(
         service.create_filter_job(dataset_id=dataset.id, cutoff_hz=-10.0, order=4)
 
     assert service.list_jobs() == []
+
+
+def test_get_job_status_returns_the_job(service, dataset):
+    created = service.create_filter_job(dataset_id=dataset.id, cutoff_hz=30.0, order=4)
+
+    fetched = service.get_job_status(created.id)
+
+    assert fetched is created
+
+
+def test_get_job_status_raises_when_job_does_not_exist(service):
+    with pytest.raises(JobNotFoundError):
+        service.get_job_status(999)
+
+
+def test_cancel_job_raises_when_job_does_not_exist(service):
+    with pytest.raises(JobNotFoundError):
+        service.cancel_job(999)
+
+
+def test_cancel_job_moves_running_job_to_cancelled_and_persists_it(service, dataset):
+    created = service.create_filter_job(dataset_id=dataset.id, cutoff_hz=30.0, order=4)
+    created.start()
+
+    service.cancel_job(created.id)
+
+    assert service.get_job_status(created.id).status is JobStatus.CANCELLED
+
+
+def test_cancel_job_on_non_running_job_raises_invalid_transition(service, dataset):
+    created = service.create_filter_job(dataset_id=dataset.id, cutoff_hz=30.0, order=4)
+
+    with pytest.raises(InvalidTransitionError):
+        service.cancel_job(created.id)
+
+    assert service.get_job_status(created.id).status is JobStatus.CREATED
