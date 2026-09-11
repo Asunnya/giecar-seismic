@@ -21,6 +21,7 @@ class Job:
     order: int
     status: JobStatus = JobStatus.CREATED
     error_message: str | None = None
+    id: int | None = None
 
     def _transition(
         self, action: str, expected: JobStatus, new_status: JobStatus
