@@ -4,7 +4,6 @@ from datetime import datetime
 
 @dataclass
 class SeismicDataset:
-    id: int
     name: str
     source_path: str
     n_inlines: int
@@ -12,6 +11,7 @@ class SeismicDataset:
     n_samples: int
     sample_rate_ms: float
     created_at: datetime = field(default_factory=datetime.now)
+    id: int | None = None
 
     @property
     def nyquist_hz(self) -> float:
