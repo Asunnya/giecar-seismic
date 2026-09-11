@@ -1,2 +1,12 @@
 volve_psdm_full_time.segy
 Prova_Tecnica_GIECAR_UFF.pdf
+*.segy
+*.sgy
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
