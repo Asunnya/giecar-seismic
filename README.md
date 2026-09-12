@@ -12,6 +12,14 @@ o volume inteiro na memória. Metadados e amplitudes são lidos em partes limita
 e o resultado é gravado aos poucos em HDF5. O processamento roda em uma QThread
 para que a interface continue respondendo durante leituras, cálculos e escritas.
 
+## Demonstração
+
+![Demonstração da aplicação](demo.webp)
+
+Importação do SEG-Y, execução do filtro com cancelamento e retomada, e comparação
+original × filtrado no visualizador (animação em 2× de velocidade; vídeo completo
+em [`demo.mp4`](demo.mp4)).
+
 ## Funcionalidades
 
 ### Funcionalidades principais
