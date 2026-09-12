@@ -254,6 +254,11 @@ class MainWindow(QMainWindow):
         self._progress_bar.setValue(0)
         layout.addWidget(self._progress_bar)
 
+        self._resume_button = QPushButton("Resume", group)
+        self._resume_button.setEnabled(False)
+        self._resume_button.clicked.connect(self._on_resume_clicked)
+        layout.addWidget(self._resume_button)
+
         self._cancel_button = QPushButton("Cancel", group)
         self._cancel_button.clicked.connect(self._on_cancel_clicked)
         layout.addWidget(self._cancel_button)
@@ -303,11 +308,6 @@ class MainWindow(QMainWindow):
         self._open_output_button.setEnabled(False)
         self._open_output_button.clicked.connect(self._on_open_output_clicked)
         layout.addWidget(self._open_output_button)
-
-        self._resume_button = QPushButton("Resume", group)
-        self._resume_button.setEnabled(False)
-        self._resume_button.clicked.connect(self._on_resume_clicked)
-        layout.addWidget(self._resume_button)
 
         self._view_output_button = QPushButton("View Output", group)
         self._view_output_button.setEnabled(False)
