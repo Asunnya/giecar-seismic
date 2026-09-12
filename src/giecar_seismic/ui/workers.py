@@ -1,4 +1,5 @@
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from pathlib import Path
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
@@ -103,12 +104,30 @@ class SegyImportWorker(QObject):
         self.succeeded.emit(dataset)
 
 
+def dataset_labels(
+    datasets: dict[int, SeismicDataset], missing: Iterable[int] = ()
+) -> dict[int, str]:
+    """Display label per dataset id: the SEG-Y file name; ` (#id)` is
+    appended only when two datasets share a file name. A dataset row
+    that no longer exists falls back to `Dataset #id`."""
+    names = {i: Path(d.source_path).name for i, d in datasets.items()}
+    counts: dict[str, int] = {}
+    for name in names.values():
+        counts[name] = counts.get(name, 0) + 1
+    labels = {
+        i: name if counts[name] == 1 else f"{name} (#{i})" for i, name in names.items()
+    }
+    labels.update({i: f"Dataset #{i}" for i in missing})
+    return labels
+
+
 class JobHistoryWorker(QObject):
     """Runs FilterJobService.list_jobs(dataset_id, status) off the GUI
-    thread and emits the resulting list of domain Jobs -- small metadata
-    objects only. Never touches a QWidget."""
+    thread and emits the resulting list of domain Jobs together with a
+    display label per dataset id (file name) -- small metadata objects
+    only. Never touches a QWidget."""
 
-    succeeded = pyqtSignal(object)  # list[Job]
+    succeeded = pyqtSignal(object, object)  # list[Job], dict[int, str]
     failed = pyqtSignal(str)
 
     def __init__(
@@ -127,7 +146,12 @@ class JobHistoryWorker(QObject):
             jobs = self._service.list_jobs(
                 dataset_id=self._dataset_id, status=self._status
             )
+            ids = {job.dataset_id for job in jobs}
+            found = {
+                i: d for i in ids if (d := self._service.get_dataset(i)) is not None
+            }
+            labels = dataset_labels(found, missing=[i for i in ids if i not in found])
         except Exception as exc:  # noqa: BLE001 -- any failure must reach the GUI via a signal
             self.failed.emit(str(exc))
             return
-        self.succeeded.emit(jobs)
+        self.succeeded.emit(jobs, labels)

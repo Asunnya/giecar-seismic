@@ -247,6 +247,11 @@ class FilterJobService:
     ) -> list[Job]:
         return self._jobs.list(dataset_id=dataset_id, status=status)
 
+    def get_dataset(self, dataset_id: int) -> SeismicDataset | None:
+        """Read accessor for presentation (labelling jobs by their
+        dataset). Not one of the spec's five functions; adds no rule."""
+        return self._datasets.get(dataset_id)
+
     def get_job_status(self, job_id: int) -> Job:
         job = self._jobs.get(job_id)
         if job is None:

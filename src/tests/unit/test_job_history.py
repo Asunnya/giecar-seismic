@@ -127,7 +127,7 @@ def _dataset(dataset_id=1) -> SeismicDataset:
     return SeismicDataset(
         id=dataset_id,
         name=f"survey{dataset_id}",
-        source_path="/s.segy",
+        source_path=f"/surveys/survey{dataset_id}.segy",
         n_inlines=1,
         n_crosslines=1,
         n_traces=4,
@@ -202,9 +202,14 @@ def test_history_worker_emits_the_jobs_or_the_failure():
     service = FilterJobService(datasets=FakeDatasetRepository([_dataset()]), jobs=repo)
     got: list[list[Job]] = []
     worker = JobHistoryWorker(service, 1, JobStatus.CREATED)
-    worker.succeeded.connect(got.append)
+    labels: list[dict[int, str]] = []
+    worker.succeeded.connect(
+        lambda jobs, names: (got.append(jobs), labels.append(names))
+    )
     worker.run()
     assert [j.id for j in got[-1]] == [1]
+    # dataset labels are resolved off the GUI thread too, file name only
+    assert labels[-1] == {1: "survey1.segy"}
     assert repo.list_calls[-1][:2] == (1, JobStatus.CREATED)
 
     repo.fail_next = True
@@ -213,6 +218,93 @@ def test_history_worker_emits_the_jobs_or_the_failure():
     bad.failed.connect(failures.append)
     bad.run()
     assert failures == ["database is locked"]
+
+
+def test_dataset_labels_use_the_file_name_and_disambiguate_collisions():
+    from giecar_seismic.ui.main_window import dataset_labels
+
+    same_name_a = SeismicDataset(
+        id=1,
+        name="a",
+        source_path="/x/survey.segy",
+        n_inlines=1,
+        n_crosslines=1,
+        n_traces=1,
+        n_samples=1,
+        sample_rate_ms=4.0,
+    )
+    same_name_b = SeismicDataset(
+        id=2,
+        name="b",
+        source_path="/y/survey.segy",
+        n_inlines=1,
+        n_crosslines=1,
+        n_traces=1,
+        n_samples=1,
+        sample_rate_ms=4.0,
+    )
+    other = SeismicDataset(
+        id=3,
+        name="c",
+        source_path="/z/other.segy",
+        n_inlines=1,
+        n_crosslines=1,
+        n_traces=1,
+        n_samples=1,
+        sample_rate_ms=4.0,
+    )
+
+    assert dataset_labels({1: same_name_a, 2: same_name_b, 3: other}) == {
+        1: "survey.segy (#1)",
+        2: "survey.segy (#2)",
+        3: "other.segy",
+    }
+    # a job whose dataset row is gone still gets a readable label
+    assert dataset_labels({}, missing=[9]) == {9: "Dataset #9"}
+
+
+def test_dataset_filter_with_colliding_file_names_still_maps_to_the_right_id(
+    qapp, wait_for_signal
+):
+    repo = RecordingJobRepository()
+    _seed(repo, 1, JobStatus.COMPLETED, _at(1))
+    _seed(repo, 2, JobStatus.COMPLETED, _at(2))
+    traces = np.zeros((4, N_SAMPLES), dtype=np.float32)
+    datasets = [_dataset(1), _dataset(2)]
+    for d in datasets:
+        d.source_path = f"/{d.id}/survey.segy"
+    service = FilterJobService(
+        datasets=FakeDatasetRepository(datasets),
+        jobs=repo,
+        reader_factory=lambda ds: FakeTraceReader(traces),
+        writer_factory=lambda job, ds: FakeTraceWriter(),
+        chunk_size=2,
+    )
+    window = MainWindow(service=service)
+    _refresh(window, wait_for_signal)
+    assert _column(window, 0, DATASET_COLUMN) == "survey.segy (#2)"
+
+    window._dataset_filter.setCurrentText("survey.segy (#2)")
+    wait_for_signal(window._history_thread.finished)
+    assert repo.list_calls[-1][:2] == (2, None)
+
+
+def test_a_job_started_in_this_session_shows_its_dataset_file_name(
+    qapp, wait_for_signal
+):
+    repo = RecordingJobRepository()
+    window = _window(repo)
+    _refresh(window, wait_for_signal)
+    window.set_dataset(_dataset(2))
+    window._run_button.click()
+    thread = window._thread
+    assert thread is not None
+    # labelled from the session dataset, before any history reload
+    assert _column(window, 0, DATASET_COLUMN) == "survey2.segy"
+    assert window._dataset_filter.findText("survey2.segy") != -1
+    wait_for_signal(thread.finished)
+    wait_for_signal(window.history_refreshed)  # terminal state -> reload
+    assert _column(window, 0, DATASET_COLUMN) == "survey2.segy"
 
 
 # --- table content -------------------------------------------------------------
@@ -264,7 +356,7 @@ def test_history_is_loaded_off_the_gui_thread_with_created_at_and_newest_first(
     assert _column(window, 1, PROGRESS_COLUMN) == "42.5%"
     assert _column(window, 2, PROGRESS_COLUMN) == "100%"
     assert _column(window, 1, STATUS_COLUMN) == "FAILED"
-    assert _column(window, 1, DATASET_COLUMN) == "Dataset #2"
+    assert _column(window, 1, DATASET_COLUMN) == "survey2.segy"
     assert window._history_status_label.text() == "3 jobs"
 
 
@@ -310,11 +402,11 @@ def test_dataset_filter_maps_to_dataset_id(qapp, wait_for_signal):
         for i in range(window._dataset_filter.count())
     ] == [
         "All datasets",
-        "Dataset #1",
-        "Dataset #2",
+        "survey1.segy",
+        "survey2.segy",
     ]
 
-    window._dataset_filter.setCurrentText("Dataset #2")
+    window._dataset_filter.setCurrentText("survey2.segy")
     wait_for_signal(window._history_thread.finished)
 
     assert repo.list_calls[-1][:2] == (2, None)
@@ -341,7 +433,7 @@ def test_status_filter_maps_to_job_status(qapp, wait_for_signal):
 def test_combined_filters_map_to_both_arguments(qapp, wait_for_signal):
     window, repo = _seeded_window()
     _refresh(window, wait_for_signal)
-    window._dataset_filter.setCurrentText("Dataset #1")
+    window._dataset_filter.setCurrentText("survey1.segy")
     wait_for_signal(window._history_thread.finished)
 
     window._status_filter.setCurrentText("FAILED")

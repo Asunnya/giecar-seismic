@@ -34,6 +34,7 @@ from giecar_seismic.ui.workers import (
     FilterJobWorker,
     JobHistoryWorker,
     SegyImportWorker,
+    dataset_labels,
 )
 
 JOBS_TABLE_HEADERS = [
@@ -137,7 +138,7 @@ class MainWindow(QMainWindow):
         self._history_thread: QThread | None = None
         self._history_worker: JobHistoryWorker | None = None
         self._table_jobs: list[Job] = []
-        self._known_dataset_ids: set[int] = set()
+        self._dataset_labels: dict[int, str] = {}  # dataset id -> file name
 
         self.setWindowTitle("GIECAR Seismic Filter")
         self._build_ui()
@@ -427,6 +428,7 @@ class MainWindow(QMainWindow):
             cutoff_hz=self._cutoff_spinbox.value(),
             order=self._order_spinbox.value(),
         )
+        self._register_session_dataset(dataset)
         self._insert_job_row(0, job)  # newest first, like the persisted history
         assert job.id is not None
         self._current_job_id = job.id
@@ -563,12 +565,8 @@ class MainWindow(QMainWindow):
     # -- Jobs history ------------------------------------------------------
 
     def _selected_history_filters(self) -> tuple[int | None, JobStatus | None]:
-        dataset_text = self._dataset_filter.currentText()
-        dataset_id = (
-            None
-            if dataset_text == ALL_DATASETS
-            else int(dataset_text.removeprefix("Dataset #"))
-        )
+        data = self._dataset_filter.currentData()
+        dataset_id = None if data is None else int(data)
         status_text = self._status_filter.currentText()
         status = None if status_text == ALL_STATUSES else JobStatus[status_text]
         return dataset_id, status
@@ -609,10 +607,10 @@ class MainWindow(QMainWindow):
         self._set_history_controls_enabled(False)
         thread.start()
 
-    def _on_history_loaded(self, jobs: list[Job]) -> None:
+    def _on_history_loaded(self, jobs: list[Job], labels: dict[int, str]) -> None:
         # Newest first: created_at, then id as a deterministic tie-break.
         ordered = sorted(jobs, key=lambda j: (j.created_at, j.id or 0), reverse=True)
-        self._known_dataset_ids.update(j.dataset_id for j in ordered)
+        self._dataset_labels.update(labels)
         self._rebuild_dataset_filter()
         self._jobs_table.setRowCount(0)
         self._table_jobs = []
@@ -633,22 +631,40 @@ class MainWindow(QMainWindow):
             self._history_result_pending = False
             self.history_refreshed.emit()
 
+    def _register_session_dataset(self, dataset: SeismicDataset) -> None:
+        """Label the current dataset before its first job row appears; the
+        next history load replaces this with the worker's labels."""
+        assert dataset.id is not None
+        if dataset.id in self._dataset_labels:
+            return
+        label = dataset_labels({dataset.id: dataset})[dataset.id]
+        if label in self._dataset_labels.values():
+            label = f"{label} (#{dataset.id})"
+        self._dataset_labels[dataset.id] = label
+        self._rebuild_dataset_filter()
+
+    def _dataset_label(self, dataset_id: int) -> str:
+        return self._dataset_labels.get(dataset_id, f"Dataset #{dataset_id}")
+
     def _rebuild_dataset_filter(self) -> None:
-        wanted = [ALL_DATASETS] + [
-            f"Dataset #{i}" for i in sorted(self._known_dataset_ids)
+        # (label, id) items; the id travels as item data so a label is
+        # never parsed back into an id.
+        wanted: list[tuple[str, int | None]] = [(ALL_DATASETS, None)] + [
+            (self._dataset_labels[i], i) for i in sorted(self._dataset_labels)
         ]
-        current = self._dataset_filter.currentText()
+        current = self._dataset_filter.currentData()
         existing = [
-            self._dataset_filter.itemText(i)
+            (self._dataset_filter.itemText(i), self._dataset_filter.itemData(i))
             for i in range(self._dataset_filter.count())
         ]
         if existing == wanted:
             return
         self._dataset_filter.blockSignals(True)
         self._dataset_filter.clear()
-        self._dataset_filter.addItems(wanted)
-        self._dataset_filter.setCurrentText(
-            current if current in wanted else ALL_DATASETS
+        for label, dataset_id in wanted:
+            self._dataset_filter.addItem(label, dataset_id)
+        self._dataset_filter.setCurrentIndex(
+            max(0, self._dataset_filter.findData(current)) if current is not None else 0
         )
         self._dataset_filter.blockSignals(False)
 
@@ -669,7 +685,7 @@ class MainWindow(QMainWindow):
     def _set_job_row(self, row: int, job: Job) -> None:
         values = [
             str(job.id),
-            f"Dataset #{job.dataset_id}",
+            self._dataset_label(job.dataset_id),
             str(job.cutoff_hz),
             str(job.order),
             job.status.name,
