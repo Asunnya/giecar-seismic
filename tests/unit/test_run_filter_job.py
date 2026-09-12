@@ -340,6 +340,142 @@ def _build_service(
     )
 
 
+@pytest.mark.parametrize("parallel_workers", [0, -1, True])
+def test_service_rejects_non_positive_parallel_worker_count(
+    dataset, parallel_workers
+):
+    with pytest.raises(ValueError, match="parallel_workers must be at least 1"):
+        FilterJobService(
+            datasets=FakeDatasetRepository([dataset]),
+            jobs=FakeJobRepository(),
+            parallel_workers=parallel_workers,
+        )
+
+
+def test_one_worker_preserves_sequential_filter_path(dataset, monkeypatch):
+    traces = np.zeros((dataset.n_traces, dataset.n_samples), dtype=np.float32)
+    reader = FakeTraceReader(traces)
+    writer = FakeTraceWriter()
+
+    def unexpected_pool(*args, **kwargs):
+        raise AssertionError("parallel_workers=1 must not create a process pool")
+
+    monkeypatch.setattr(
+        "giecar_seismic.application.filter_jobs.ProcessPoolExecutor", unexpected_pool
+    )
+    service = FilterJobService(
+        datasets=FakeDatasetRepository([dataset]),
+        jobs=FakeJobRepository(),
+        reader_factory=lambda _dataset: reader,
+        writer_factory=lambda _job, _dataset: writer,
+        chunk_size=2,
+        parallel_workers=1,
+    )
+    job = service.create_filter_job(dataset.id, 30.0, 4)
+
+    finished = service.run_filter_job(job.id, lambda _pct: None, FakeCancelToken())
+
+    assert finished.status is JobStatus.COMPLETED
+    assert reader.read_calls == [(0, 2), (2, 4), (4, 6), (6, 8), (8, 10)]
+
+
+def test_parallel_pool_is_reused_and_shutdown_after_subprocess_failure(
+    dataset, monkeypatch
+):
+    traces = np.zeros((dataset.n_traces, dataset.n_samples), dtype=np.float32)
+    reader = FakeTraceReader(traces)
+    writer = FakeTraceWriter()
+    pools = []
+
+    class FakePool:
+        def __init__(self, *, max_workers, mp_context):
+            self.max_workers = max_workers
+            self.start_method = mp_context.get_start_method()
+            self.shutdown_calls = []
+            pools.append(self)
+
+        def shutdown(self, *, wait, cancel_futures):
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    def fail_filter(*args, **kwargs):
+        raise RuntimeError("subprocess filtering failed")
+
+    monkeypatch.setattr(
+        "giecar_seismic.application.filter_jobs.ProcessPoolExecutor", FakePool
+    )
+    monkeypatch.setattr(
+        "giecar_seismic.application.filter_jobs.filter_chunk_with_executor",
+        fail_filter,
+    )
+    service = FilterJobService(
+        datasets=FakeDatasetRepository([dataset]),
+        jobs=FakeJobRepository(),
+        reader_factory=lambda _dataset: reader,
+        writer_factory=lambda _job, _dataset: writer,
+        chunk_size=2,
+        parallel_workers=3,
+    )
+    job = service.create_filter_job(dataset.id, 30.0, 4)
+
+    result = service.run_filter_job(job.id, lambda _pct: None, FakeCancelToken())
+
+    assert result.status is JobStatus.FAILED
+    assert result.error_message == "subprocess filtering failed"
+    assert writer.written == []
+    assert writer.finalized is False
+    assert len(pools) == 1
+    assert pools[0].max_workers == 3
+    assert pools[0].start_method == "spawn"
+    assert pools[0].shutdown_calls == [(True, True)]
+
+
+def test_parallel_pool_is_created_once_and_reused_for_all_chunks(dataset, monkeypatch):
+    from concurrent.futures import Future
+
+    traces = np.arange(
+        dataset.n_traces * dataset.n_samples, dtype=np.float32
+    ).reshape(dataset.n_traces, dataset.n_samples)
+    reader = FakeTraceReader(traces)
+    writer = FakeTraceWriter()
+    pools = []
+
+    class ImmediatePool:
+        def __init__(self, *, max_workers, mp_context):
+            self.submit_count = 0
+            self.shutdown_count = 0
+            pools.append(self)
+
+        def submit(self, fn, *args):
+            self.submit_count += 1
+            future = Future()
+            future.set_result(fn(*args))
+            return future
+
+        def shutdown(self, *, wait, cancel_futures):
+            assert (wait, cancel_futures) == (True, True)
+            self.shutdown_count += 1
+
+    monkeypatch.setattr(
+        "giecar_seismic.application.filter_jobs.ProcessPoolExecutor", ImmediatePool
+    )
+    service = FilterJobService(
+        datasets=FakeDatasetRepository([dataset]),
+        jobs=FakeJobRepository(),
+        reader_factory=lambda _dataset: reader,
+        writer_factory=lambda _job, _dataset: writer,
+        chunk_size=4,
+        parallel_workers=3,
+    )
+    job = service.create_filter_job(dataset.id, 30.0, 4)
+
+    result = service.run_filter_job(job.id, lambda _pct: None, FakeCancelToken())
+
+    assert result.status is JobStatus.COMPLETED
+    assert len(pools) == 1
+    assert pools[0].submit_count == 8  # 3 + 3 + 2 non-empty partitions
+    assert pools[0].shutdown_count == 1
+
+
 def test_run_filter_job_completes_and_writes_all_chunks(dataset):
     traces = np.zeros((10, dataset.n_samples), dtype=np.float32)
     reader = FakeTraceReader(traces)

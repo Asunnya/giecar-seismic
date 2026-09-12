@@ -32,6 +32,8 @@ para que a interface continue respondendo durante leituras, cálculos e escritas
 - Filtros High-pass (Low-cut) e Band-pass (Low + High cut).
 - Retomada de um job `CANCELLED` no próximo traço após o último checkpoint HDF5
   confirmado, usando o mesmo job e o mesmo arquivo de saída.
+- Multiprocessing opcional apenas na filtragem de grupos de traços dentro de cada
+  chunk, preservando a ordem física na saída.
 - Viewer sísmico para linhas inline e crossline, com dados originais, filtrados e
   diferença.
 - Exibição raster ou wiggle, ajuste de ganho, clip e mapa de cores.
@@ -60,13 +62,15 @@ Há dois fluxos de leitura limitada:
 - **Importação:** cabeçalhos SEG-Y → lotes de até 4096 traços → metadados. As listas
   temporárias dependem do lote; somente os identificadores distintos de inline e
   crossline são mantidos. Nenhuma amplitude é lida.
-- **Processamento:** amplitudes SEG-Y → chunk configurável → Butterworth → escrita
-  HDF5 → checkpoint → atualização do job.
+- **Processamento:** amplitudes SEG-Y → chunk configurável → Butterworth sequencial
+  ou em pool de processos → escrita HDF5 → checkpoint → atualização do job.
 
 A memória de trabalho da importação é
 `O(batch_size + unique_inlines + unique_crosslines)`. Durante a filtragem, é
-`O(chunk_size × n_samples)`. Em nenhum dos dois fluxos a memória cresce com o
-volume completo de amplitudes.
+`O(chunk_size × n_samples)` no modo sequencial. No modo paralelo, há
+cópias para serialização e partições nos subprocessos, então o uso também cresce
+com a quantidade de processos. Em nenhum modo a memória depende do total de
+traços do volume: somente um chunk lógico fica em processamento por vez.
 
 ## Fluxograma da solução
 
@@ -80,8 +84,12 @@ flowchart TD
     F --> G[Validar e abrir SEG-Y e HDF5]
     G --> H{Cancelamento solicitado?}
     H -- Não --> I[Ler próximo chunk de amplitudes]
-    I --> J[Aplicar Butterworth com fase zero]
-    J --> K[Escrever chunk no HDF5]
+    I --> J{Mais de um processo?}
+    J -- Não --> J1[Filtrar chunk no coordenador]
+    J -- Sim --> J2[Filtrar grupos de traços no pool]
+    J2 --> J3[Reunir na ordem física]
+    J1 --> K[Escrever chunk no HDF5]
+    J3 --> K
     K --> L[Confirmar checkpoint HDF5]
     L --> M[Persistir traços processados e progresso]
     M --> N{Ainda há traços?}
@@ -113,6 +121,7 @@ sequenceDiagram
     participant SQLite as SQLite / repositories
     participant Segy as SEG-Y reader
     participant Filtro as Butterworth filter
+    participant Pool as Pool de processos opcional
     participant HDF5 as HDF5 writer
 
     Usuario->>Main: Seleciona SEG-Y e configura o filtro
@@ -129,8 +138,15 @@ sequenceDiagram
     loop Enquanto restarem traços e o token estiver ativo
         Service->>Segy: read_chunk(start, stop)
         Segy-->>Service: Amplitudes do chunk
-        Service->>Filtro: Aplica filtro SOS zero-phase
-        Filtro-->>Service: Chunk filtrado
+        alt GIECAR_FILTER_PROCESSES = 1
+            Service->>Filtro: Aplica filtro SOS zero-phase
+            Filtro-->>Service: Chunk filtrado
+        else Mais de um processo
+            Service->>Pool: Envia grupos contíguos e o mesmo SOS
+            Pool->>Filtro: Filtra grupos independentes
+            Filtro-->>Pool: Partições filtradas
+            Pool-->>Service: Chunk reunido na ordem física
+        end
         Service->>HDF5: write_chunk + checkpoint
         HDF5-->>Service: Prefixo persistido
         Service->>SQLite: Atualiza processed_traces e progresso
@@ -180,6 +196,18 @@ Execute a aplicação:
 uv run giecar-seismic
 ```
 
+Por padrão, a filtragem usa um processo. Para distribuir os grupos de traços de
+cada chunk entre dois processos:
+
+```bash
+GIECAR_FILTER_PROCESSES=2 uv run giecar-seismic
+```
+
+O valor deve ser um inteiro entre `1` e a quantidade de CPUs disponíveis. Valores
+inválidos produzem um erro claro antes da criação da interface. A leitura SEG-Y,
+a escrita HDF5, o checkpoint, o SQLite e os sinais da interface continuam no
+processo coordenador.
+
 Os dados locais são criados em `~/.giecar-seismic/`:
 
 - `giecar.sqlite`: conjuntos de dados, jobs e índice de geometria;
@@ -222,10 +250,28 @@ memória limitada na importação, renderizadores e comunicação da interface.
 | --- | --- | --- | --- |
 | Arquivos sísmicos podem superar 25 GB. | Ler cabeçalhos e amplitudes em partes limitadas. | O pico de memória não depende do volume completo. | Há mais coordenação de lotes e mais chamadas de I/O. |
 | Filtragem e I/O podem demorar. | Executar o serviço em worker/QThread. | A interface continua responsiva e pode solicitar cancelamento. | O ciclo de vida da thread e dos sinais precisa ser controlado. |
+| Traços de um chunk são independentes durante o filtro. | Permitir um `ProcessPoolExecutor` com contexto `spawn`, ativado por variável de ambiente. | Pode usar mais de um núcleo sem compartilhar SEG-Y, HDF5, SQLite ou PyQt5. | Serialização e cópias aumentam tempo e memória; o ganho depende da máquina, do chunk e do número de amostras. |
 | Datasets, jobs e geometria precisam sobreviver ao fechamento. | Usar SQLite com SQLAlchemy. | Banco local simples, consultas claras e domínio sem dependência do ORM. | Não há migrações automáticas; mudanças de schema exigem ação consciente. |
 | A saída é grande e precisa ser gravada aos poucos. | Usar HDF5 com dataset extensível. | Escrita incremental, leitura seletiva e um arquivo por job. | O flush por chunk tem custo e o arquivo exige consistência cuidadosa na retomada. |
 | Um processamento cancelado pode já ter horas de trabalho. | Confirmar checkpoint por chunk e permitir a retomada de `CANCELLED`. | Evita repetir CPU e I/O já concluídos. | HDF5 e SQLite não formam uma transação única; divergências precisam ser reconciliadas ou rejeitadas. |
 | A malha pode ter posições ausentes. | Abrir SEG-Y com `ignore_geometry=True` e indexar traços físicos. | Malhas irregulares continuam válidas. | O índice de geometria precisa ser construído separadamente. |
+
+### Multiprocessing: quando usar
+
+O pool nasce uma vez por execução do job e é encerrado em conclusão, falha ou
+cancelamento. Cada chunk é dividido em poucos grupos contíguos; os resultados são
+reunidos na mesma ordem antes da escrita. Cancelamento e resume continuam nas
+fronteiras duráveis de chunk. O contexto `spawn` inicia subprocessos limpos, sem
+copiar por `fork` o processo que já contém threads e objetos do PyQt5.
+
+O recurso é opt-in porque nem todo dado se beneficia dele. Em uma medição local
+com o SEG-Y deste repositório, usando 80 filtragens de um chunk real de `256 × 850`
+amostras e três repetições, as medianas foram `0,3091 s` com 1 processo, `1,2282 s`
+com 2 e `1,2826 s` com 4. A criação do pool foi incluída em cada repetição. Nesse
+caso, a serialização custou mais que o paralelismo economizou. Traços mais longos
+ou filtros mais caros podem mudar essa relação; por isso o padrão permanece `1`.
+Como NumPy e SciPy também podem usar bibliotecas nativas com paralelismo interno,
+aumentar o número de processos pode ainda causar disputa pelos mesmos núcleos.
 
 ### Por que HDF5?
 
@@ -275,5 +321,6 @@ detalhes de UI e armazenamento. Os testes cobrem essas fronteiras com unidades
 isoladas, integrações reais e fluxos E2E.
 
 Melhorias futuras naturais seriam adicionar migrações de banco, oferecer ajustes de
-chunk na configuração, reforçar a identificação do arquivo de origem e avaliar Zarr
-se o projeto passar a usar armazenamento remoto ou processamento distribuído.
+chunk e processos na interface, reforçar a identificação do arquivo de origem e
+avaliar Zarr se o projeto passar a usar armazenamento remoto ou processamento
+distribuído.

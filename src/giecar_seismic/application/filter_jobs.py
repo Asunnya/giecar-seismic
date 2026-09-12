@@ -1,11 +1,17 @@
 import threading
 from collections.abc import Callable
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import get_context
 from typing import Protocol
 
 import numpy as np
 
-from giecar_seismic.application.butterworth_filter import apply_butterworth_filter
+from giecar_seismic.application.butterworth_filter import (
+    apply_butterworth_filter,
+    butterworth_sos,
+)
 from giecar_seismic.application.dataset_import import read_source_fingerprint
+from giecar_seismic.application.parallel_filter import filter_chunk_with_executor
 from giecar_seismic.domain.dataset import SeismicDataset
 from giecar_seismic.domain.job import FilterType, InvalidTransitionError, Job, JobStatus
 
@@ -222,15 +228,23 @@ class FilterJobService:
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         *,
         resume_writer_factory: ResumeWriterFactory | None = None,
+        parallel_workers: int = 1,
     ):
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
+        if (
+            isinstance(parallel_workers, bool)
+            or not isinstance(parallel_workers, int)
+            or parallel_workers < 1
+        ):
+            raise ValueError("parallel_workers must be at least 1")
         self._resume_writer_factory = resume_writer_factory
         self._datasets = datasets
         self._jobs = jobs
         self._reader_factory = reader_factory
         self._writer_factory = writer_factory
         self._chunk_size = chunk_size
+        self._parallel_workers = parallel_workers
         # Tracks the single active run_filter_job() execution per job id
         # (see _RunRegistration), so that:
         #   - cancel_job() -- which does not receive the token as an
@@ -454,6 +468,7 @@ class FilterJobService:
 
             reader: TraceReader | None = None
             writer: TraceWriter | None = None
+            executor: ProcessPoolExecutor | None = None
 
             try:
                 # Both factories run inside the try block: once the job is
@@ -529,6 +544,22 @@ class FilterJobService:
                     job.output_path = writer.output_path
                     self._jobs.update(job)
 
+                sos: np.ndarray | None = None
+                if self._parallel_workers > 1 and start_trace < trace_count:
+                    # One scientific design and one spawn-based pool per job
+                    # execution. Neither resource crosses into SEG-Y/HDF5/Qt.
+                    sos = butterworth_sos(
+                        job.cutoff_hz,
+                        job.order,
+                        dataset.sample_rate_ms,
+                        filter_type=job.filter_type,
+                        upper_cutoff_hz=job.upper_cutoff_hz,
+                    )
+                    executor = ProcessPoolExecutor(
+                        max_workers=self._parallel_workers,
+                        mp_context=get_context("spawn"),
+                    )
+
                 for start in range(start_trace, trace_count, self._chunk_size):
                     if cancel_token.is_cancelled():
                         job.cancel()
@@ -536,14 +567,23 @@ class FilterJobService:
 
                     stop = min(start + self._chunk_size, trace_count)
                     chunk = reader.read_chunk(start, stop)
-                    filtered = apply_butterworth_filter(
-                        chunk,
-                        job.cutoff_hz,
-                        job.order,
-                        dataset.sample_rate_ms,
-                        filter_type=job.filter_type,
-                        upper_cutoff_hz=job.upper_cutoff_hz,
-                    )
+                    if executor is None:
+                        filtered = apply_butterworth_filter(
+                            chunk,
+                            job.cutoff_hz,
+                            job.order,
+                            dataset.sample_rate_ms,
+                            filter_type=job.filter_type,
+                            upper_cutoff_hz=job.upper_cutoff_hz,
+                        )
+                    else:
+                        assert sos is not None
+                        filtered = filter_chunk_with_executor(
+                            chunk,
+                            sos,
+                            executor,
+                            parallel_workers=self._parallel_workers,
+                        )
                     writer.write_chunk(start, filtered)
                     # Progress is processed / *physical* trace_count (from
                     # the reader), never n_inlines * n_crosslines. One
@@ -602,6 +642,11 @@ class FilterJobService:
                 # leave the job stuck in RUNNING. Not re-raised or logged
                 # yet -- that's future work, not part of this lifecycle
                 # fix.
+                if executor is not None:
+                    try:
+                        executor.shutdown(wait=True, cancel_futures=True)
+                    except Exception:  # noqa: BLE001, S110 -- best-effort cleanup
+                        pass
                 if reader is not None:
                     try:
                         reader.close()

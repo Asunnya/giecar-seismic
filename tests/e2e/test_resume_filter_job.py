@@ -20,11 +20,14 @@ from giecar_seismic.infrastructure.storage.hdf5_writer import open_hdf5_resume_w
 from tests.e2e.test_end_to_end_filter_pipeline import FOOTPRINTS, compose, write_segy
 
 
-def setup_cancelled(tmp_path, chunk_size=2):
+def setup_cancelled(tmp_path, chunk_size=2, parallel_workers=1):
     source = tmp_path / "survey.segy"
     amplitudes = write_segy(source, FOOTPRINTS[0], 64, 4000)
     engine, importer, service = compose(
-        tmp_path / "jobs.sqlite", tmp_path / "outputs", chunk_size
+        tmp_path / "jobs.sqlite",
+        tmp_path / "outputs",
+        chunk_size,
+        parallel_workers=parallel_workers,
     )
     dataset = importer(str(source), "irregular")
     job = service.create_filter_job(dataset.id, 30, 4)
@@ -33,7 +36,7 @@ def setup_cancelled(tmp_path, chunk_size=2):
     return engine, dataset, job, amplitudes
 
 
-def resumed_service(engine, reads, chunk_size=2):
+def resumed_service(engine, reads, chunk_size=2, parallel_workers=1):
     def reader_factory(dataset):
         reader = open_dataset_reader(dataset)
         original = reader.read_chunk
@@ -53,6 +56,7 @@ def resumed_service(engine, reads, chunk_size=2):
         reader_factory=reader_factory,
         resume_writer_factory=open_hdf5_resume_writer,
         chunk_size=chunk_size,
+        parallel_workers=parallel_workers,
     )
     return service, jobs
 
@@ -118,6 +122,57 @@ def test_resume_e2e_reopens_stores_and_cancels_twice_without_reprocessing(tmp_pa
             atol=1e-6,
         )
     engine.dispose()
+
+
+def test_multiprocess_cancel_and_resume_matches_sequential_pipeline(tmp_path):
+    import multiprocessing
+
+    from giecar_seismic.infrastructure.database.engine import create_sqlite_engine
+
+    children_before = {child.pid for child in multiprocessing.active_children()}
+    engine, dataset, cancelled, _ = setup_cancelled(
+        tmp_path, chunk_size=2, parallel_workers=2
+    )
+    assert cancelled.status is JobStatus.CANCELLED
+    assert cancelled.processed_traces == 2
+    output_path = cancelled.output_path
+    engine.dispose()
+
+    engine = create_sqlite_engine(tmp_path / "jobs.sqlite")
+    reads = []
+    service, _ = resumed_service(
+        engine, reads, chunk_size=2, parallel_workers=2
+    )
+    resumed = service.resume_filter_job(
+        cancelled.id, lambda _: None, CooperativeCancelToken()
+    )
+    assert resumed.status is JobStatus.COMPLETED
+    assert reads == [(2, 4), (4, 6), (6, 8)]
+    assert resumed.output_path == output_path
+
+    reference_engine, _, reference_service = compose(
+        tmp_path / "jobs.sqlite",
+        tmp_path / "reference-outputs",
+        2,
+        parallel_workers=1,
+    )
+    reference = reference_service.create_filter_job(dataset.id, 30, 4)
+    reference = reference_service.run_filter_job(
+        reference.id, lambda _: None, CooperativeCancelToken()
+    )
+    with (
+        h5py.File(resumed.output_path, "r") as resumed_file,
+        h5py.File(reference.output_path, "r") as reference_file,
+    ):
+        np.testing.assert_array_equal(
+            resumed_file["traces"][:], reference_file["traces"][:]
+        )
+        assert resumed_file.attrs["complete"]
+    engine.dispose()
+    reference_engine.dispose()
+    assert {
+        child.pid for child in multiprocessing.active_children()
+    } <= children_before
 
 
 @pytest.mark.parametrize("sql_count", [0, 2, 3])

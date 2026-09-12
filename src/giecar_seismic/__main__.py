@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -37,11 +38,40 @@ DEFAULT_DATABASE_PATH = APP_DIR / "giecar.sqlite"
 DEFAULT_OUTPUTS_DIR = APP_DIR / "outputs"
 
 
+def parse_filter_process_count(
+    raw_value: str | None, *, available_cpus: int | None = None
+) -> int:
+    """Parse the opt-in process count before any GUI resource is created."""
+    value = (raw_value or "").strip()
+    if not value:
+        return 1
+    try:
+        processes = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            "GIECAR_FILTER_PROCESSES must be an integer greater than or equal to 1"
+        ) from exc
+    if processes < 1:
+        raise ValueError(
+            "GIECAR_FILTER_PROCESSES must be an integer greater than or equal to 1"
+        )
+    cpu_limit = max(1, available_cpus or os.cpu_count() or 1)
+    if processes > cpu_limit:
+        raise ValueError(
+            "GIECAR_FILTER_PROCESSES cannot exceed the available CPUs "
+            f"({cpu_limit}), got {processes}"
+        )
+    return processes
+
+
 def main() -> int:
     # Composition root: the only place that knows about SQLite/SQLAlchemy,
     # segyio and h5py together. The UI receives plain callables/objects
     # (ImportDatasetUseCase, FilterJobService) and never touches any of
     # those libraries itself.
+    parallel_workers = parse_filter_process_count(
+        os.environ.get("GIECAR_FILTER_PROCESSES")
+    )
     APP_DIR.mkdir(parents=True, exist_ok=True)
     engine = create_sqlite_engine(DEFAULT_DATABASE_PATH)
     # create_all is not a migration: it only adds missing tables. A
@@ -58,6 +88,7 @@ def main() -> int:
         reader_factory=open_dataset_reader,
         writer_factory=make_hdf5_writer_factory(DEFAULT_OUTPUTS_DIR),
         resume_writer_factory=open_hdf5_resume_writer,
+        parallel_workers=parallel_workers,
     )
 
     # Viewer: geometry index (built lazily, in bounded batches, on first

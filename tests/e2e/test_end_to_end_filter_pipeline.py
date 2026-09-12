@@ -103,7 +103,13 @@ def segy_facts(path: Path) -> tuple[int, int, float]:
 # --- composition (mirrors __main__.py, with temporary paths) --------------
 
 
-def compose(db_path: Path, outputs_dir: Path, chunk_size: int):
+def compose(
+    db_path: Path,
+    outputs_dir: Path,
+    chunk_size: int,
+    *,
+    parallel_workers: int = 1,
+):
     engine = create_sqlite_engine(db_path)
     create_schema(engine)
     factory = make_session_factory(engine)
@@ -116,6 +122,7 @@ def compose(db_path: Path, outputs_dir: Path, chunk_size: int):
         reader_factory=open_dataset_reader,
         writer_factory=make_hdf5_writer_factory(outputs_dir),
         chunk_size=chunk_size,
+        parallel_workers=parallel_workers,
     )
     return engine, import_dataset, service
 
