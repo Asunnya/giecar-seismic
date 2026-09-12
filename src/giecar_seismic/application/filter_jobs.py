@@ -33,6 +33,14 @@ class TraceReader(Protocol):
 
 
 class TraceWriter(Protocol):
+    @property
+    def output_path(self) -> str:
+        """Where this writer's output lives, known as soon as the writer
+        exists -- the service records it on the Job right after creating
+        the writer, before any chunk is processed. Read-only.
+        """
+        ...
+
     def write_chunk(self, start: int, chunk: np.ndarray) -> None: ...
 
     def finalize(self) -> None:
@@ -103,7 +111,10 @@ class CooperativeCancelToken:
 
 
 ReaderFactory = Callable[[SeismicDataset], TraceReader]
-WriterFactory = Callable[[Job], TraceWriter]
+# The writer needs the dataset's physical trace count and samples per
+# trace to size its output; run_filter_job() already holds the dataset,
+# so it is passed in rather than re-fetched from the repository.
+WriterFactory = Callable[[Job, SeismicDataset], TraceWriter]
 ProgressCallback = Callable[[float], None]
 
 
@@ -131,6 +142,15 @@ class CancellationWindowClosedError(Exception):
     """Raised by cancel_job() when the job's worker has already committed
     to finalizing its output (crossed the point of no return) and can no
     longer honor a cancellation request. See _RunRegistration.committed.
+    """
+
+
+class TraceCountMismatchError(Exception):
+    """Raised by run_filter_job() when the SEG-Y opened for processing
+    does not have the physical trace count recorded on the dataset at
+    import time (e.g. the file was replaced or truncated since). Progress
+    and the HDF5 output are both sized from that count, so proceeding
+    would silently produce inconsistent results; the job fails instead.
     """
 
 
@@ -342,9 +362,25 @@ class FilterJobService:
                 # terminal job state and never leak whichever of the two
                 # resources did get created.
                 reader = self._reader_factory(dataset)
-                writer = self._writer_factory(job)
-
                 trace_count = reader.trace_count
+                # The reader re-opens the file; the dataset carries the
+                # physical count measured at import. They must agree --
+                # both progress and the writer's expected_trace_count are
+                # derived from it. Checked before any output file exists.
+                if trace_count != dataset.n_traces:
+                    raise TraceCountMismatchError(
+                        f"SEG-Y has {trace_count} traces but dataset "
+                        f"{dataset.id} was imported with {dataset.n_traces}"
+                    )
+
+                writer = self._writer_factory(job, dataset)
+                # The output exists (possibly empty) from this point on:
+                # record where it lives before processing a single chunk,
+                # so a FAILED/CANCELLED job still points at its partial
+                # file. If the factory raised, output_path stays None.
+                job.output_path = writer.output_path
+                self._jobs.update(job)
+
                 for start in range(0, trace_count, self._chunk_size):
                     if cancel_token.is_cancelled():
                         job.cancel()

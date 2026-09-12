@@ -57,6 +57,8 @@ class FakeTraceReader:
 
 
 class FakeTraceWriter:
+    output_path = "/fake/output.h5"
+
     def __init__(self) -> None:
         self.written: list[tuple[int, np.ndarray]] = []
         self.finalized = False
@@ -72,6 +74,8 @@ class FakeTraceWriter:
 
 
 class RaisingWriteChunkTraceWriter:
+    output_path = "/fake/output.h5"
+
     def write_chunk(self, start: int, chunk: np.ndarray) -> None:
         raise OSError("disk full")
 
@@ -127,7 +131,7 @@ def _build_service(dataset: SeismicDataset, reader, writer, chunk_size: int = 1)
         datasets=FakeDatasetRepository([dataset]),
         jobs=FakeJobRepository(),
         reader_factory=lambda ds: reader,
-        writer_factory=lambda job: writer,
+        writer_factory=lambda job, dataset: writer,
         chunk_size=chunk_size,
     )
 
@@ -185,7 +189,7 @@ def test_starting_a_job_disables_run_and_enables_cancel_immediately(
     qapp, wait_for_signal
 ):
     dataset = _dataset()
-    traces = np.zeros((2, N_SAMPLES), dtype=np.float32)
+    traces = np.zeros((4, N_SAMPLES), dtype=np.float32)
     service = _build_service(
         dataset, FakeTraceReader(traces), FakeTraceWriter(), chunk_size=2
     )
@@ -213,7 +217,7 @@ def test_completed_job_restores_controls_and_updates_the_jobs_table(
     qapp, wait_for_signal
 ):
     dataset = _dataset()
-    traces = np.zeros((2, N_SAMPLES), dtype=np.float32)
+    traces = np.zeros((4, N_SAMPLES), dtype=np.float32)
     writer = FakeTraceWriter()
     service = _build_service(dataset, FakeTraceReader(traces), writer, chunk_size=2)
     window = MainWindow(service=service)
@@ -244,7 +248,7 @@ def test_failed_job_reaches_the_ui_through_a_signal_and_is_not_swallowed(
     qapp, wait_for_signal
 ):
     dataset = _dataset()
-    traces = np.zeros((2, N_SAMPLES), dtype=np.float32)
+    traces = np.zeros((4, N_SAMPLES), dtype=np.float32)
     service = _build_service(
         dataset, FakeTraceReader(traces), RaisingWriteChunkTraceWriter(), chunk_size=2
     )

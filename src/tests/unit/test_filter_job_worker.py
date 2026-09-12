@@ -54,6 +54,8 @@ class FakeTraceReader:
 
 
 class FakeTraceWriter:
+    output_path = "/fake/output.h5"
+
     def __init__(self) -> None:
         self.written: list[tuple[int, np.ndarray]] = []
         self.finalized = False
@@ -69,6 +71,8 @@ class FakeTraceWriter:
 
 
 class RaisingWriteChunkTraceWriter:
+    output_path = "/fake/output.h5"
+
     def write_chunk(self, start: int, chunk: np.ndarray) -> None:
         raise OSError("disk full")
 
@@ -86,7 +90,7 @@ def _build_service(
         datasets=FakeDatasetRepository([dataset]),
         jobs=FakeJobRepository(),
         reader_factory=lambda ds: reader,
-        writer_factory=lambda job: writer,
+        writer_factory=lambda job, dataset: writer,
         chunk_size=chunk_size,
     )
 

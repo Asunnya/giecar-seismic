@@ -84,6 +84,8 @@ class FakeTraceWriter:
     happens strictly before the job transitions to COMPLETED.
     """
 
+    output_path = "/fake/output.h5"
+
     def __init__(self, job: Job | None = None) -> None:
         self.written: list[tuple[int, np.ndarray]] = []
         self.finalized = False
@@ -111,6 +113,8 @@ class WriteChunkRaisingTraceWriter:
     clean up resources without ever treating the output as finalized.
     """
 
+    output_path = "/fake/output.h5"
+
     def __init__(self) -> None:
         self.finalized = False
         self.closed = False
@@ -130,6 +134,8 @@ class FinalizeRaisingTraceWriter:
     to prove a failed finalize() never counts as success and still cleans
     up.
     """
+
+    output_path = "/fake/output.h5"
 
     def __init__(self) -> None:
         self.written: list[tuple[int, np.ndarray]] = []
@@ -175,6 +181,8 @@ class CloseRaisingTraceWriter:
     prove close() failing must not undo an already-valid job transition.
     """
 
+    output_path = "/fake/output.h5"
+
     def __init__(self) -> None:
         self.written: list[tuple[int, np.ndarray]] = []
         self.finalized = False
@@ -196,6 +204,8 @@ class WriteChunkAndCloseRaisingTraceWriter:
     also fails, to prove the primary processing error is preserved as
     error_message even when the subsequent cleanup attempt fails too.
     """
+
+    output_path = "/fake/output.h5"
 
     def __init__(self) -> None:
         self.finalized = False
@@ -293,7 +303,7 @@ def dataset() -> SeismicDataset:
         source_path="/data/survey.segy",
         n_inlines=401,
         n_crosslines=720,
-        n_traces=288694,
+        n_traces=10,  # matches the fake readers below (physical count, not 401*720)
         n_samples=850,
         sample_rate_ms=4.0,  # nyquist_hz == 125.0
     )
@@ -310,7 +320,7 @@ def _build_service(
         datasets=FakeDatasetRepository([dataset]),
         jobs=jobs if jobs is not None else FakeJobRepository(),
         reader_factory=lambda ds: reader,
-        writer_factory=lambda job: writer,
+        writer_factory=lambda job, dataset: writer,
         chunk_size=chunk_size,
     )
 
@@ -320,7 +330,7 @@ def test_run_filter_job_completes_and_writes_all_chunks(dataset):
     reader = FakeTraceReader(traces)
     created_writers: list[FakeTraceWriter] = []
 
-    def writer_factory(job: Job) -> FakeTraceWriter:
+    def writer_factory(job: Job, dataset: SeismicDataset) -> FakeTraceWriter:
         # capture `job` so the writer can record the job's status at the
         # instant finalize() runs -- see job_status_at_finalize below.
         writer = FakeTraceWriter(job=job)
@@ -421,7 +431,7 @@ def test_run_filter_job_fails_the_job_when_reading_raises(dataset):
         datasets=FakeDatasetRepository([dataset]),
         jobs=jobs,
         reader_factory=lambda ds: reader,
-        writer_factory=lambda job: writer,
+        writer_factory=lambda job, dataset: writer,
         chunk_size=4,
     )
     job = service.create_filter_job(dataset_id=dataset.id, cutoff_hz=30.0, order=4)
@@ -471,7 +481,7 @@ def test_run_filter_job_fails_when_reader_factory_raises_before_start_completes(
     def raising_reader_factory(ds: SeismicDataset) -> FakeTraceReader:
         raise OSError("cannot open segy file")
 
-    def recording_writer_factory(job: Job) -> FakeTraceWriter:
+    def recording_writer_factory(job: Job, dataset: SeismicDataset) -> FakeTraceWriter:
         writer_factory_calls.append(job)
         return FakeTraceWriter()
 
@@ -500,7 +510,7 @@ def test_run_filter_job_closes_reader_and_fails_when_writer_factory_raises(datas
     traces = np.zeros((10, dataset.n_samples), dtype=np.float32)
     reader = FakeTraceReader(traces)
 
-    def raising_writer_factory(job: Job) -> FakeTraceWriter:
+    def raising_writer_factory(job: Job, dataset: SeismicDataset) -> FakeTraceWriter:
         raise OSError("cannot open output store")
 
     service = FilterJobService(
@@ -667,7 +677,7 @@ def test_run_filter_job_defers_a_cancellation_requested_mid_chunk(dataset):
         datasets=FakeDatasetRepository([dataset]),
         jobs=jobs,
         reader_factory=lambda ds: reader_holder[0],
-        writer_factory=lambda job: writer,
+        writer_factory=lambda job, dataset: writer,
         chunk_size=4,
     )
     job = service.create_filter_job(dataset_id=dataset.id, cutoff_hz=30.0, order=4)
@@ -706,7 +716,7 @@ def test_run_filter_job_observes_cancellation_requested_during_the_last_chunk(
         datasets=FakeDatasetRepository([dataset]),
         jobs=jobs,
         reader_factory=lambda ds: reader_holder[0],
-        writer_factory=lambda job: writer,
+        writer_factory=lambda job, dataset: writer,
         chunk_size=4,
     )
     job = service.create_filter_job(dataset_id=dataset.id, cutoff_hz=30.0, order=4)
@@ -747,7 +757,7 @@ def test_run_filter_job_treats_repeated_cancel_requests_idempotently(dataset):
         datasets=FakeDatasetRepository([dataset]),
         jobs=jobs,
         reader_factory=lambda ds: reader_holder[0],
-        writer_factory=lambda job: writer,
+        writer_factory=lambda job, dataset: writer,
         chunk_size=4,
     )
     job = service.create_filter_job(dataset_id=dataset.id, cutoff_hz=30.0, order=4)
@@ -790,6 +800,8 @@ class BlockingLastChunkTraceWriter:
     point-of-no-return check (which happens immediately afterwards, with
     no I/O in between).
     """
+
+    output_path = "/fake/output.h5"
 
     def __init__(
         self,
@@ -864,6 +876,8 @@ class BlockingFinalizeTraceWriter:
     worker has already committed past the point of no return -- and then
     blocks on `resume` before actually completing.
     """
+
+    output_path = "/fake/output.h5"
 
     def __init__(self, finalize_started: threading.Event, resume: threading.Event):
         self.written: list[tuple[int, np.ndarray]] = []
@@ -946,7 +960,7 @@ def _build_service_with_blocking_reader_factory(
         datasets=FakeDatasetRepository([dataset]),
         jobs=FakeJobRepository(),
         reader_factory=reader_factory,
-        writer_factory=lambda job: writer,
+        writer_factory=lambda job, dataset: writer,
         chunk_size=4,
     )
     assert dataset.id is not None
@@ -1177,8 +1191,8 @@ def test_run_filter_job_persists_incremental_progress_from_physical_trace_count(
     dataset,
 ):
     # 10 physical traces / chunk_size 4 -> chunk boundaries at 4, 8, 10.
-    # The dataset's grid says 401 x 720 = 288720 -- the progress must come
-    # from reader.trace_count, never from the grid.
+    # The dataset's grid says 401 x 720 = 288720 -- progress must come from
+    # reader.trace_count (10, the physical count), never from the grid.
     traces = np.zeros((10, dataset.n_samples), dtype=np.float32)
     reader = FakeTraceReader(traces)
     writer = FakeTraceWriter()
@@ -1198,8 +1212,12 @@ def test_run_filter_job_persists_incremental_progress_from_physical_trace_count(
         for (_, status, _, progress) in jobs.progress_calls
         if status is JobStatus.RUNNING
     ]
-    assert running_progress == [0, 40.0, 80.0, 100.0]
-    assert service.get_job_status(job.id).progress == 100
+    # start() persisted at 0, then output_path registration at 0 (once the
+    # writer exists), then one update per chunk: 4/10, 8/10, 10/10.
+    assert running_progress == [0, 0, 40.0, 80.0, 100.0]
+    completed = service.get_job_status(job.id)
+    assert completed.progress == 100
+    assert completed.output_path == "/fake/output.h5"
 
 
 def test_run_filter_job_cancellation_keeps_the_last_progress_reached(dataset):
@@ -1222,3 +1240,89 @@ def test_run_filter_job_cancellation_keeps_the_last_progress_reached(dataset):
     assert cancelled.progress == 40.0
     assert cancelled.finished_at is not None
     assert (job.id, JobStatus.CANCELLED, None, 40.0) in jobs.progress_calls
+
+
+# --- output_path registration and physical trace-count validation ---------
+
+
+def test_run_filter_job_fails_before_creating_a_writer_on_trace_count_mismatch(
+    dataset,
+):
+    # dataset fixture says n_traces=10, but the file the reader opens now
+    # has 12 -- e.g. it was replaced after import. Progress and the HDF5
+    # size are derived from that count, so the job must fail clearly,
+    # before any output file is created.
+    traces = np.zeros((12, dataset.n_samples), dtype=np.float32)
+    reader = FakeTraceReader(traces)
+    writer_factory_calls: list[Job] = []
+    jobs = FakeJobRepository()
+
+    def recording_writer_factory(job: Job, ds: SeismicDataset) -> FakeTraceWriter:
+        writer_factory_calls.append(job)
+        return FakeTraceWriter()
+
+    service = FilterJobService(
+        datasets=FakeDatasetRepository([dataset]),
+        jobs=jobs,
+        reader_factory=lambda ds: reader,
+        writer_factory=recording_writer_factory,
+        chunk_size=4,
+    )
+    job = service.create_filter_job(dataset_id=dataset.id, cutoff_hz=30.0, order=4)
+
+    service.run_filter_job(
+        job.id, progress_callback=lambda _pct: None, cancel_token=FakeCancelToken()
+    )
+
+    failed = service.get_job_status(job.id)
+    assert failed.status is JobStatus.FAILED
+    assert "12 traces" in (failed.error_message or "")
+    assert "10" in (failed.error_message or "")
+    assert failed.output_path is None
+    assert writer_factory_calls == []
+    assert reader.read_calls == []
+    assert reader.closed is True
+
+
+def test_run_filter_job_records_output_path_before_processing_any_chunk(dataset):
+    traces = np.zeros((10, dataset.n_samples), dtype=np.float32)
+    reader = FakeTraceReader(traces)
+    writer = FakeTraceWriter()
+    writer.output_path = "/out/job-1.h5"
+    jobs = FakeJobRepository()
+    service = _build_service(dataset, reader, writer, chunk_size=4, jobs=jobs)
+    job = service.create_filter_job(dataset_id=dataset.id, cutoff_hz=30.0, order=4)
+
+    service.run_filter_job(
+        job.id, progress_callback=lambda _pct: None, cancel_token=FakeCancelToken()
+    )
+
+    assert service.get_job_status(job.id).output_path == "/out/job-1.h5"
+    # the update that carried output_path happened while RUNNING at
+    # progress 0 -- i.e. before the first chunk was written.
+    assert (job.id, JobStatus.RUNNING, None, 0.0) in jobs.progress_calls
+
+
+def test_run_filter_job_leaves_output_path_none_when_writer_factory_raises(dataset):
+    traces = np.zeros((10, dataset.n_samples), dtype=np.float32)
+    reader = FakeTraceReader(traces)
+
+    def raising_writer_factory(job: Job, ds: SeismicDataset) -> FakeTraceWriter:
+        raise OSError("cannot create output file")
+
+    service = FilterJobService(
+        datasets=FakeDatasetRepository([dataset]),
+        jobs=FakeJobRepository(),
+        reader_factory=lambda ds: reader,
+        writer_factory=raising_writer_factory,
+        chunk_size=4,
+    )
+    job = service.create_filter_job(dataset_id=dataset.id, cutoff_hz=30.0, order=4)
+
+    service.run_filter_job(
+        job.id, progress_callback=lambda _pct: None, cancel_token=FakeCancelToken()
+    )
+
+    failed = service.get_job_status(job.id)
+    assert failed.status is JobStatus.FAILED
+    assert failed.output_path is None

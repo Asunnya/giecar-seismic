@@ -5,6 +5,8 @@ from typing import Self
 import numpy as np
 import segyio
 
+from giecar_seismic.domain.dataset import SeismicDataset
+
 
 class SegyTraceReader:
     """Streaming trace access over a SEG-Y file via segyio.
@@ -47,3 +49,11 @@ class SegyTraceReader:
         traceback: TracebackType | None,
     ) -> None:
         self.close()
+
+
+def open_dataset_reader(dataset: SeismicDataset) -> SegyTraceReader:
+    """ReaderFactory for FilterJobService: re-opens the dataset's SEG-Y for
+    streaming. The service cross-checks reader.trace_count against
+    dataset.n_traces before processing.
+    """
+    return SegyTraceReader(dataset.source_path)

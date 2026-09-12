@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from pathlib import Path
 from types import TracebackType
 from typing import Self
@@ -5,6 +6,9 @@ from typing import Self
 import h5py
 import numpy as np
 import numpy.typing as npt
+
+from giecar_seismic.domain.dataset import SeismicDataset
+from giecar_seismic.domain.job import Job
 
 TRACES_DATASET_NAME = "traces"
 
@@ -71,6 +75,7 @@ class Hdf5TraceWriter:
         self._closed = False
         self._finalized = False
 
+        self._output_path = str(output_path)
         self._file = h5py.File(output_path, mode="w")
         storage_chunk_traces = min(chunk_size, expected_trace_count)
         self._traces = self._file.create_dataset(
@@ -84,6 +89,10 @@ class Hdf5TraceWriter:
         self._file.attrs["n_samples"] = n_samples
         self._file.attrs["written_trace_count"] = 0
         self._file.attrs["complete"] = False
+
+    @property
+    def output_path(self) -> str:
+        return self._output_path
 
     def write_chunk(self, start: int, chunk: np.ndarray) -> None:
         if self._closed:
@@ -129,14 +138,22 @@ class Hdf5TraceWriter:
                 "written"
             )
 
-        # Flush before marking complete, not after: if flush() raises,
-        # execution never reaches the line that claims the output is
-        # complete. This guarantees -- by construction, not by rolling
-        # back on failure -- that a finalize() call which raises can
-        # never leave complete=True, and that a subsequent close() can
-        # never promote a failed finalize() to complete either.
+        # 1) Flush the trace data while `complete` is still False: if
+        #    this raises, the marker line is never reached.
+        # 2) Set the marker, then flush it too -- a finalize() that returns
+        #    normally has durably written *both* the data and the
+        #    completeness marker, not just left the marker in HDF5's cache
+        #    for close() to flush later. If that second flush raises, the
+        #    in-memory marker is reverted before re-raising, so neither
+        #    this object nor a later close() can claim completeness a
+        #    failed finalize() never achieved.
         self._file.flush()
         self._file.attrs["complete"] = True
+        try:
+            self._file.flush()
+        except Exception:
+            self._file.attrs["complete"] = False
+            raise
         self._finalized = True
 
     def close(self) -> None:
@@ -155,3 +172,36 @@ class Hdf5TraceWriter:
         traceback: TracebackType | None,
     ) -> None:
         self.close()
+
+
+def job_output_path(output_dir: str | Path, job_id: int) -> Path:
+    """Deterministic per-job output location: <output_dir>/job-<id>.h5.
+
+    The job id is unique and stable, so nothing else (timestamps, random
+    suffixes) is needed to avoid collisions -- and the path can be
+    reconstructed from the Job alone. The directory itself is chosen by
+    the composition root, never by the UI.
+    """
+    return Path(output_dir) / f"job-{job_id}.h5"
+
+
+def make_hdf5_writer_factory(
+    output_dir: str | Path,
+) -> Callable[[Job, SeismicDataset], Hdf5TraceWriter]:
+    """WriterFactory for FilterJobService: one Hdf5TraceWriter per job,
+    sized from the dataset's *physical* trace count and samples per trace
+    -- never n_inlines * n_crosslines.
+    """
+    directory = Path(output_dir)
+
+    def factory(job: Job, dataset: SeismicDataset) -> Hdf5TraceWriter:
+        if job.id is None:
+            raise ValueError("cannot create an output for a job without an id")
+        directory.mkdir(parents=True, exist_ok=True)
+        return Hdf5TraceWriter(
+            output_path=job_output_path(directory, job.id),
+            expected_trace_count=dataset.n_traces,
+            n_samples=dataset.n_samples,
+        )
+
+    return factory

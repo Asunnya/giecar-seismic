@@ -4,6 +4,7 @@ from pathlib import Path
 from PyQt5.QtWidgets import QApplication
 
 from giecar_seismic.application.dataset_import import ImportDatasetUseCase
+from giecar_seismic.application.filter_jobs import FilterJobService
 from giecar_seismic.infrastructure.database.engine import (
     create_schema,
     create_sqlite_engine,
@@ -11,32 +12,44 @@ from giecar_seismic.infrastructure.database.engine import (
 )
 from giecar_seismic.infrastructure.database.repositories import (
     SqlAlchemyDatasetRepository,
+    SqlAlchemyJobRepository,
 )
 from giecar_seismic.infrastructure.segy.dataset_importer import import_segy_dataset
+from giecar_seismic.infrastructure.segy.reader import open_dataset_reader
+from giecar_seismic.infrastructure.storage.hdf5_writer import make_hdf5_writer_factory
 from giecar_seismic.ui.main_window import MainWindow
 
-# Plain default for now -- a settings mechanism is out of scope until
+# Plain defaults for now -- a settings mechanism is out of scope until
 # there's more than one thing to configure.
-DEFAULT_DATABASE_PATH = Path.home() / ".giecar-seismic" / "giecar.sqlite"
+APP_DIR = Path.home() / ".giecar-seismic"
+DEFAULT_DATABASE_PATH = APP_DIR / "giecar.sqlite"
+DEFAULT_OUTPUTS_DIR = APP_DIR / "outputs"
 
 
 def main() -> int:
-    # Composition root: the only place that knows about SQLite, SQLAlchemy
-    # and segyio together. The UI receives a plain callable.
-    #
-    # Only the dataset import is composed. `service` (FilterJobService)
-    # is still not: the SEG-Y/HDF5 reader/writer factories it needs for a
-    # real end-to-end run aren't wired yet, and faking them here would
-    # hide that gap behind a demo. The window opens with service=None,
-    # visibly incomplete (Run Filter stays disabled) until that lands.
-    DEFAULT_DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Composition root: the only place that knows about SQLite/SQLAlchemy,
+    # segyio and h5py together. The UI receives plain callables/objects
+    # (ImportDatasetUseCase, FilterJobService) and never touches any of
+    # those libraries itself.
+    APP_DIR.mkdir(parents=True, exist_ok=True)
     engine = create_sqlite_engine(DEFAULT_DATABASE_PATH)
-    create_schema(engine)  # no migrations in this challenge: idempotent create_all
-    datasets = SqlAlchemyDatasetRepository(make_session_factory(engine))
+    # create_all is not a migration: it only adds missing tables. A
+    # database created with an older schema must be recreated explicitly.
+    create_schema(engine)
+    session_factory = make_session_factory(engine)
+    datasets = SqlAlchemyDatasetRepository(session_factory)
+    jobs = SqlAlchemyJobRepository(session_factory)
+
     import_dataset = ImportDatasetUseCase(import_segy_dataset, datasets)
+    service = FilterJobService(
+        datasets=datasets,
+        jobs=jobs,
+        reader_factory=open_dataset_reader,
+        writer_factory=make_hdf5_writer_factory(DEFAULT_OUTPUTS_DIR),
+    )
 
     app = QApplication(sys.argv)
-    window = MainWindow(dataset_importer=import_dataset)
+    window = MainWindow(service=service, dataset_importer=import_dataset)
     window.show()
     return app.exec_()
 

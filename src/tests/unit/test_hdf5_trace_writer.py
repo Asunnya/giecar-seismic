@@ -231,7 +231,9 @@ def test_finalize_flushes_before_marking_the_file_complete(tmp_path):
     # `complete` must still be False at the moment flush() runs: the
     # written trace data is durably flushed *before* finalize() ever
     # claims the output is complete, not after.
-    assert complete_flag_during_flush == [False]
+    # data is flushed while complete is still False, then the marker is
+    # set and flushed too -- a finalize() that returns has flushed both.
+    assert complete_flag_during_flush == [False, True]
     assert bool(writer._file.attrs["complete"]) is True
     writer.close()
 
@@ -336,3 +338,40 @@ def test_constructor_rejects_non_positive_chunk_size(tmp_path, invalid_chunk_siz
         )
 
     assert not path.exists()
+
+
+def test_finalize_rolls_back_complete_when_flushing_the_marker_fails(tmp_path):
+    writer, path = _make_writer(tmp_path, expected_trace_count=4, n_samples=4)
+    writer.write_chunk(0, np.zeros((4, 4), dtype=np.float32))
+    original_flush = writer._file.flush
+    calls: list[int] = []
+
+    def second_flush_fails() -> None:
+        calls.append(1)
+        if len(calls) == 2:
+            raise OSError("simulated flush failure on the completeness marker")
+        original_flush()
+
+    writer._file.flush = second_flush_fails  # type: ignore[method-assign]
+
+    with pytest.raises(OSError):
+        writer.finalize()
+
+    # the data flush succeeded but the marker flush did not: finalize()
+    # raised, so the in-memory marker must not claim completeness either.
+    assert bool(writer._file.attrs["complete"]) is False
+
+    writer._file.flush = original_flush  # type: ignore[method-assign]
+    writer.close()
+    with h5py.File(path, "r") as f:
+        assert bool(f.attrs["complete"]) is False
+
+
+def test_writer_exposes_its_output_path_read_only(tmp_path):
+    writer, path = _make_writer(tmp_path, expected_trace_count=4, n_samples=4)
+
+    assert writer.output_path == str(path)
+    with pytest.raises(AttributeError):
+        writer.output_path = "/elsewhere.h5"  # type: ignore[misc]
+
+    writer.close()
