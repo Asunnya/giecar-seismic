@@ -33,6 +33,7 @@ from giecar_seismic.application.filter_jobs import (
     InvalidFilterParametersError,
     NoActiveExecutionError,
 )
+from giecar_seismic.application.seismic_viewer import FilterPreview, ViewerTarget
 from giecar_seismic.domain.dataset import SeismicDataset
 from giecar_seismic.domain.job import (
     FilterType,
@@ -81,9 +82,10 @@ def format_progress(progress: float) -> str:
     return f"{progress:g}%"
 
 
-# Opens the seismic viewer for a job id; composed in __main__ so this
-# window never imports the viewer's service/infrastructure wiring.
-ViewerOpener = Callable[[int, QWidget], QWidget]
+# Opens the seismic viewer for a job id or a FilterPreview; composed in
+# __main__ so this window never imports the viewer's service/infrastructure
+# wiring.
+ViewerOpener = Callable[[ViewerTarget, QWidget], QWidget]
 
 # Keeps the cutoff spinbox strictly below Nyquist (0 < cutoff_hz <
 # nyquist_hz, per FilterJobService.create_filter_job) by one step.
@@ -257,6 +259,14 @@ class MainWindow(QMainWindow):
         self._order_spinbox.setRange(2, 8)
         self._order_spinbox.setValue(4)
         form.addRow("Order:", self._order_spinbox)
+
+        self._preview_button = QPushButton("Preview", group)
+        self._preview_button.setToolTip(
+            "Open the viewer and apply these parameters in memory to the "
+            "section on screen -- no job is created and nothing is written."
+        )
+        self._preview_button.clicked.connect(self._on_preview_clicked)
+        form.addRow(self._preview_button)
 
         self._run_button = QPushButton("Run Filter", group)
         self._run_button.clicked.connect(self._on_run_clicked)
@@ -512,11 +522,42 @@ class MainWindow(QMainWindow):
         running = self._thread is not None
         importing = self._import_thread is not None
         self._run_button.setEnabled(self._can_run() and not running and not importing)
+        # A preview only needs a persisted dataset and valid parameters: it
+        # reads SEG-Y through its own reader, so it may coexist with a run.
+        self._preview_button.setEnabled(
+            self._can_run() and self._open_viewer is not None and not importing
+        )
         self._cancel_button.setEnabled(running)
         self._refresh_output_buttons()
         self._select_segy_button.setEnabled(
             self._dataset_importer is not None and not importing and not running
         )
+
+    def _upper_cutoff_hz(self) -> float | None:
+        return (
+            self._upper_cutoff_spinbox.value()
+            if self.filter_type is FilterType.BAND_PASS
+            else None
+        )
+
+    def _on_preview_clicked(self) -> None:
+        if not self._can_run() or self._open_viewer is None:
+            return
+        dataset = self._dataset
+        assert dataset is not None and dataset.id is not None
+        preview = FilterPreview(
+            dataset_id=dataset.id,
+            cutoff_hz=self._cutoff_spinbox.value(),
+            order=self._order_spinbox.value(),
+            filter_type=self.filter_type,
+            upper_cutoff_hz=self._upper_cutoff_hz(),
+        )
+        try:
+            self._viewer = self._open_viewer(preview, self)
+        except InvalidFilterParametersError as exc:
+            self._status_label.setText(f"Invalid filter: {exc}")
+            return
+        self._viewer.show()
 
     def _on_run_clicked(self) -> None:
         if not self._can_run() or self._thread is not None:
@@ -533,11 +574,7 @@ class MainWindow(QMainWindow):
                 cutoff_hz=self._cutoff_spinbox.value(),
                 order=self._order_spinbox.value(),
                 filter_type=self.filter_type,
-                upper_cutoff_hz=(
-                    self._upper_cutoff_spinbox.value()
-                    if self.filter_type is FilterType.BAND_PASS
-                    else None
-                ),
+                upper_cutoff_hz=self._upper_cutoff_hz(),
             )
         except InvalidFilterParametersError as exc:
             self._status_label.setText(f"Invalid filter: {exc}")

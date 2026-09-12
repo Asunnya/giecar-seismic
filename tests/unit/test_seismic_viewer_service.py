@@ -12,7 +12,10 @@ Fixture geometry (3x3 envelope, (11, 3) missing -> 8 physical traces):
 import numpy as np
 import pytest
 
+from giecar_seismic.application.butterworth_filter import apply_butterworth_filter
+from giecar_seismic.application.filter_jobs import InvalidFilterParametersError
 from giecar_seismic.application.seismic_viewer import (
+    FilterPreview,
     SectionTooLargeError,
     SeismicSection,
     SeismicViewerService,
@@ -20,7 +23,7 @@ from giecar_seismic.application.seismic_viewer import (
 )
 from giecar_seismic.domain.dataset import SeismicDataset
 from giecar_seismic.domain.geometry import LineOrientation, TraceGeometry
-from giecar_seismic.domain.job import Job, JobStatus
+from giecar_seismic.domain.job import FilterType, Job, JobStatus
 
 HEADERS = [(10, 1), (10, 2), (10, 3), (11, 1), (11, 2), (12, 1), (12, 2), (12, 3)]
 N_SAMPLES = 32
@@ -311,3 +314,108 @@ def test_section_is_a_plain_value_object_without_qt_or_matplotlib():
         "filtered",
         "sample_rate_ms",
     }
+
+
+# --- preview (filter parameters on a dataset, no job, no HDF5) ---------------
+
+
+def _preview(**overrides) -> FilterPreview:
+    params = {"dataset_id": 1, "cutoff_hz": 30.0, "order": 4}
+    params.update(overrides)
+    return FilterPreview(**params)
+
+
+def test_preview_context_is_an_unpersisted_job_flagged_as_preview(world):
+    service, *_ = world
+
+    ctx = service.context(_preview(filter_type=FilterType.HIGH_PASS))
+
+    assert ctx.preview is True
+    assert ctx.dataset.id == 1
+    assert ctx.job.id is None
+    assert ctx.job.status is JobStatus.CREATED
+    assert (ctx.job.cutoff_hz, ctx.job.order, ctx.job.filter_type) == (
+        30.0,
+        4,
+        FilterType.HIGH_PASS,
+    )
+
+
+def test_job_context_is_not_a_preview(world):
+    service, *_ = world
+    assert service.context(7).preview is False
+
+
+def test_preview_rejects_parameters_the_job_would_reject(world):
+    service, *_ = world
+    nyquist = 500 / SAMPLE_RATE_MS
+    with pytest.raises(InvalidFilterParametersError, match="Nyquist"):
+        service.context(_preview(cutoff_hz=nyquist))
+    with pytest.raises(InvalidFilterParametersError, match="order"):
+        service.context(_preview(order=9))
+    with pytest.raises(InvalidFilterParametersError, match="upper_cutoff_hz"):
+        service.context(_preview(filter_type=FilterType.BAND_PASS))
+
+
+def test_preview_of_unknown_dataset_is_not_viewable(world):
+    service, *_ = world
+    with pytest.raises(ViewerJobNotViewableError, match="dataset 99"):
+        service.context(_preview(dataset_id=99))
+
+
+@pytest.mark.parametrize(
+    "preview",
+    [
+        _preview(),
+        _preview(filter_type=FilterType.HIGH_PASS),
+        _preview(
+            filter_type=FilterType.BAND_PASS, cutoff_hz=20.0, upper_cutoff_hz=50.0
+        ),
+    ],
+    ids=["low", "high", "band"],
+)
+def test_preview_section_filters_the_line_in_memory_and_never_opens_the_output(
+    world, preview
+):
+    service, original, _, readers = world
+
+    section = service.load_section(preview, LineOrientation.INLINE, 12)
+
+    assert readers["filtered"] == []  # no HDF5 / job output touched
+    assert readers["original"][0].requests == [[5, 6, 7]]  # only this line's traces
+    assert section.filtered.dtype == np.float32
+    expected = apply_butterworth_filter(
+        original[[5, 6, 7]],
+        preview.cutoff_hz,
+        preview.order,
+        SAMPLE_RATE_MS,
+        filter_type=preview.filter_type,
+        upper_cutoff_hz=preview.upper_cutoff_hz,
+    )
+    np.testing.assert_allclose(section.filtered, expected, rtol=1e-5, atol=1e-6)
+    np.testing.assert_array_equal(section.original, original[[5, 6, 7]])
+
+
+def test_preview_section_keeps_gaps_as_nan(world):
+    service, *_ = world
+    section = service.load_section(_preview(), LineOrientation.INLINE, 11)
+    assert list(section.physical_trace_indices) == [3, 4, -1]
+    assert np.isnan(section.filtered[2]).all()
+    assert np.isfinite(section.filtered[:2]).all()
+
+
+def test_preview_trace_selection_and_spectrum_carry_the_preview_parameters(world):
+    service, *_ = world
+    preview = _preview(
+        filter_type=FilterType.BAND_PASS, cutoff_hz=20.0, upper_cutoff_hz=50.0
+    )
+    section = service.load_section(preview, LineOrientation.INLINE, 10)
+
+    view = service.select_trace(preview, section, coordinate=2.0)
+
+    assert view is not None
+    assert view.job.id is None
+    assert view.geometry.trace_index == 1
+    spectrum = service.spectrum(view)
+    assert [m.frequency_hz for m in spectrum.cutoff_markers] == [20.0, 50.0]
+    assert spectrum.filter_response is not None

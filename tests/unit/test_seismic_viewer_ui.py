@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from giecar_seismic.application.seismic_viewer import (
+    FilterPreview,
     SeismicSection,
     TraceSpectrum,
     TraceView,
@@ -123,7 +124,7 @@ def _open(qapp, wait_for_signal, build_index=None):
         index_calls.append(dataset)
         return True
 
-    viewer = SeismicViewer(service, build_index or default_build, job_id=7)
+    viewer = SeismicViewer(service, build_index or default_build, target=7)
     # geometry index thread, then first section thread
     for _ in range(2):
         thread = viewer._thread
@@ -392,3 +393,59 @@ def test_wiggle_stride_decimates_only_beyond_the_display_budget():
     assert wiggle_stride(200) == 1
     assert wiggle_stride(201) == 2
     assert wiggle_stride(1000) == 5
+
+
+# --- preview target ----------------------------------------------------------
+
+
+class PreviewRecordingService(FakeViewerService):
+    """Same fake, but records the target handed to each call and answers
+    context() as a preview (unpersisted job, preview=True)."""
+
+    def __init__(self):
+        super().__init__()
+        self.targets: list[object] = []
+
+    def context(self, target):
+        self.targets.append(target)
+        job = Job(dataset_id=1, cutoff_hz=25.0, order=6)
+        return ViewerContext(dataset=_dataset(), job=job, preview=True)
+
+    def load_section(self, target, orientation, line_number):
+        self.targets.append(target)
+        return super().load_section(target, orientation, line_number)
+
+    def select_trace(self, target, section, coordinate):
+        self.targets.append(target)
+        view = super().select_trace(target, section, coordinate)
+        if view is None:
+            return None
+        return TraceView(
+            view.geometry,
+            view.time_ms,
+            view.original,
+            view.filtered,
+            view.dataset,
+            Job(dataset_id=1, cutoff_hz=25.0, order=6),
+        )
+
+
+def test_preview_target_reaches_every_service_call_and_is_labelled_as_such(
+    qapp, wait_for_signal
+):
+    preview = FilterPreview(dataset_id=1, cutoff_hz=25.0, order=6)
+    service = PreviewRecordingService()
+
+    viewer = SeismicViewer(service, lambda d: True, target=preview)
+    for _ in range(2):
+        thread = viewer._thread
+        assert thread is not None
+        wait_for_signal(thread.finished)
+    viewer.select_coordinate(1.0)
+
+    assert "preview" in viewer.windowTitle()
+    assert "job" not in viewer.windowTitle().split("--")[1].split("(")[0]
+    assert all(target == preview for target in service.targets)
+    assert "Preview: Filter type" in viewer._trace_info_label.text()
+    assert "Job None" not in viewer._trace_info_label.text()
+    viewer.close()

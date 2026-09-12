@@ -1,5 +1,6 @@
 import os
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -59,7 +60,9 @@ def test_use_case_reads_metadata_with_the_given_path_and_name():
 
     use_case("/data/survey.segy", "survey")
 
-    assert calls == [("/data/survey.segy", "survey")]
+    # The reader receives the path the user chose, in its resolved form --
+    # which is platform-specific (a drive letter is prepended on Windows).
+    assert calls == [(str(Path("/data/survey.segy").resolve()), "survey")]
 
 
 def test_use_case_persists_the_imported_entity_and_returns_the_persisted_one():
@@ -156,7 +159,9 @@ def test_importing_a_new_path_reads_and_persists_as_before():
     result = use_case("/data/other.segy", "other")
 
     assert result.id == 42
-    assert [d.source_path for d in repository.added] == ["/data/other.segy"]
+    assert [d.source_path for d in repository.added] == [
+        str(Path("/data/other.segy").resolve())
+    ]
 
 
 def test_source_path_is_normalized_before_lookup_and_import(tmp_path):
@@ -165,8 +170,6 @@ def test_source_path_is_normalized_before_lookup_and_import(tmp_path):
     real = tmp_path / "surveys" / "survey.segy"
     real.parent.mkdir()
     real.write_bytes(b"segy")
-    link = tmp_path / "link.segy"
-    link.symlink_to(real)
     existing = replace(
         _unpersisted_dataset(),
         id=7,
@@ -182,13 +185,23 @@ def test_source_path_is_normalized_before_lookup_and_import(tmp_path):
 
     use_case = ImportDatasetUseCase(read_metadata, repository)
 
-    assert use_case(str(link), "survey") == existing
     assert (
         use_case(str(tmp_path / "surveys" / ".." / "surveys" / "survey.segy"), "survey")
         == existing
     )
     assert reads == []
-    assert repository.lookups == [str(real), str(real)]
+    assert repository.lookups == [str(real)]
+
+    # Symlinks need a privilege on Windows: cover them where the OS allows.
+    link = tmp_path / "link.segy"
+    try:
+        link.symlink_to(real)
+    except OSError:
+        link = None
+    if link is not None:
+        assert use_case(str(link), "survey") == existing
+        assert reads == []
+        assert repository.lookups == [str(real), str(real)]
 
     # a genuinely new file is imported under its resolved path, whatever was typed
     other = tmp_path / "surveys" / "other.segy"
@@ -240,7 +253,10 @@ def test_a_changed_file_at_the_same_path_is_imported_as_a_new_dataset(tmp_path, 
     if change == "size":
         _touch(path, b"v2 -- longer")
     else:
-        os.utime(path, ns=(0, old.source_fingerprint.mtime_ns + 1))
+        # Above any filesystem's timestamp granularity (NTFS 100 ns, FAT 2 s):
+        # a +1 ns bump would round back to the same mtime on Windows.
+        os.utime(path, ns=(0, old.source_fingerprint.mtime_ns + 2_000_000_000))
+    assert read_source_fingerprint(path) != old.source_fingerprint
     reads: list[str] = []
 
     def read_metadata(source_path: str, name: str) -> SeismicDataset:

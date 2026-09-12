@@ -5,9 +5,13 @@ import numpy as np
 import pytest
 from PyQt5.QtWidgets import QGroupBox
 
-from giecar_seismic.application.filter_jobs import FilterJobService
+from giecar_seismic.application.filter_jobs import (
+    FilterJobService,
+    InvalidFilterParametersError,
+)
+from giecar_seismic.application.seismic_viewer import FilterPreview
 from giecar_seismic.domain.dataset import SeismicDataset
-from giecar_seismic.domain.job import Job, JobStatus
+from giecar_seismic.domain.job import FilterType, Job, JobStatus
 from giecar_seismic.ui import main_window as main_window_module
 from giecar_seismic.ui.main_window import JOBS_TABLE_HEADERS, STATUS_COLUMN, MainWindow
 
@@ -804,3 +808,84 @@ def test_view_output_is_disabled_when_no_viewer_is_composed(qapp, wait_for_signa
     window._jobs_table.selectRow(0)
 
     assert window._view_output_button.isEnabled() is False
+
+
+# --- Preview -> seismic viewer with a FilterPreview (no job created) ----------
+
+
+def _preview_window(qapp, opened: list):
+    from PyQt5.QtWidgets import QWidget
+
+    dataset = _dataset()
+    service = _build_service(
+        dataset, FakeTraceReader(np.zeros((4, N_SAMPLES))), FakeTraceWriter()
+    )
+
+    def fake_open_viewer(target, parent: QWidget) -> QWidget:
+        opened.append(target)
+        return QWidget(parent)
+
+    window = MainWindow(service=service, open_viewer=fake_open_viewer)
+    return window, dataset
+
+
+def test_preview_button_needs_a_persisted_dataset_and_a_composed_viewer(qapp):
+    opened: list = []
+    window, dataset = _preview_window(qapp, opened)
+    assert window._preview_button.isEnabled() is False  # no dataset yet
+
+    window.set_dataset(dataset)
+    assert window._preview_button.isEnabled() is True
+
+    window._open_viewer = None
+    window._refresh_controls()
+    assert window._preview_button.isEnabled() is False
+
+
+def test_preview_opens_the_viewer_with_the_current_parameters_and_no_job(
+    qapp, wait_for_signal
+):
+    opened: list = []
+    window, dataset = _preview_window(qapp, opened)
+    window.set_dataset(dataset)
+    window._filter_type_combo.setCurrentIndex(
+        window._filter_type_combo.findData(FilterType.BAND_PASS)
+    )
+    window._upper_cutoff_spinbox.setValue(60.0)
+    window._cutoff_spinbox.setValue(20.0)
+    window._order_spinbox.setValue(6)
+
+    window._preview_button.click()
+
+    assert opened == [
+        FilterPreview(
+            dataset_id=1,
+            cutoff_hz=20.0,
+            order=6,
+            filter_type=FilterType.BAND_PASS,
+            upper_cutoff_hz=60.0,
+        )
+    ]
+    assert window._jobs_table.rowCount() == 0  # nothing created, nothing run
+    assert window._thread is None
+    while window._history_thread is not None:
+        wait_for_signal(window._history_thread.finished)
+
+
+def test_preview_reports_parameters_rejected_by_the_viewer_without_opening_it(
+    qapp, wait_for_signal
+):
+    opened: list = []
+    window, dataset = _preview_window(qapp, opened)
+    window.set_dataset(dataset)
+
+    def rejecting_open_viewer(target, parent):
+        raise InvalidFilterParametersError("boom")
+
+    window._open_viewer = rejecting_open_viewer
+    window._preview_button.click()
+
+    assert window._status_label.text() == "Invalid filter: boom"
+    assert window._viewer is None
+    while window._history_thread is not None:
+        wait_for_signal(window._history_thread.finished)

@@ -247,6 +247,49 @@ def _short(exc: BaseException, limit: int = 200) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
+def validate_filter_parameters(
+    dataset: SeismicDataset,
+    cutoff_hz: float,
+    order: int,
+    *,
+    filter_type: FilterType = FilterType.LOW_PASS,
+    upper_cutoff_hz: float | None = None,
+) -> None:
+    """The business rules a filter must satisfy for `dataset`, shared by
+    create_filter_job() and the viewer's in-memory preview so a preview
+    can never show parameters the job itself would reject."""
+    if not (0 < cutoff_hz < dataset.nyquist_hz):
+        raise InvalidFilterParametersError(
+            f"cutoff_hz must be between 0 and the dataset's Nyquist "
+            f"frequency ({dataset.nyquist_hz} Hz), got {cutoff_hz}"
+        )
+
+    if not isinstance(filter_type, FilterType):
+        raise InvalidFilterParametersError("filter_type must be a FilterType member")
+    if filter_type is FilterType.BAND_PASS:
+        if upper_cutoff_hz is None or not (
+            cutoff_hz < upper_cutoff_hz < dataset.nyquist_hz
+        ):
+            raise InvalidFilterParametersError(
+                "upper_cutoff_hz is required for BAND_PASS and must satisfy "
+                f"cutoff_hz < upper_cutoff_hz < Nyquist ({dataset.nyquist_hz} Hz)"
+            )
+    elif upper_cutoff_hz is not None:
+        raise InvalidFilterParametersError(
+            "upper_cutoff_hz must be None for LOW_PASS and HIGH_PASS"
+        )
+
+    if (
+        isinstance(order, bool)
+        or not isinstance(order, int)
+        or not MIN_FILTER_ORDER <= order <= MAX_FILTER_ORDER
+    ):
+        raise InvalidFilterParametersError(
+            f"order must be between {MIN_FILTER_ORDER} and "
+            f"{MAX_FILTER_ORDER}, got {order}"
+        )
+
+
 class FilterJobService:
     def __init__(
         self,
@@ -359,38 +402,13 @@ class FilterJobService:
         if dataset is None:
             raise DatasetNotFoundError(f"dataset {dataset_id} not found")
 
-        if not (0 < cutoff_hz < dataset.nyquist_hz):
-            raise InvalidFilterParametersError(
-                f"cutoff_hz must be between 0 and the dataset's Nyquist "
-                f"frequency ({dataset.nyquist_hz} Hz), got {cutoff_hz}"
-            )
-
-        if not isinstance(filter_type, FilterType):
-            raise InvalidFilterParametersError(
-                "filter_type must be a FilterType member"
-            )
-        if filter_type is FilterType.BAND_PASS:
-            if upper_cutoff_hz is None or not (
-                cutoff_hz < upper_cutoff_hz < dataset.nyquist_hz
-            ):
-                raise InvalidFilterParametersError(
-                    "upper_cutoff_hz is required for BAND_PASS and must satisfy "
-                    f"cutoff_hz < upper_cutoff_hz < Nyquist ({dataset.nyquist_hz} Hz)"
-                )
-        elif upper_cutoff_hz is not None:
-            raise InvalidFilterParametersError(
-                "upper_cutoff_hz must be None for LOW_PASS and HIGH_PASS"
-            )
-
-        if (
-            isinstance(order, bool)
-            or not isinstance(order, int)
-            or not MIN_FILTER_ORDER <= order <= MAX_FILTER_ORDER
-        ):
-            raise InvalidFilterParametersError(
-                f"order must be between {MIN_FILTER_ORDER} and "
-                f"{MAX_FILTER_ORDER}, got {order}"
-            )
+        validate_filter_parameters(
+            dataset,
+            cutoff_hz,
+            order,
+            filter_type=filter_type,
+            upper_cutoff_hz=upper_cutoff_hz,
+        )
 
         job = Job(
             dataset_id=dataset_id,

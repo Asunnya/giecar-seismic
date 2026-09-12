@@ -1,4 +1,5 @@
-"""2D seismic section viewer (QC of a filter job's output).
+"""2D seismic section viewer (QC of a filter job's output, or a preview
+of filter parameters on a dataset before any job is created).
 
 Layout: a navigation/display bar on top; below it, a splitter with the
 section view on the left and, on the right, the selected trace's
@@ -47,6 +48,7 @@ from giecar_seismic.application.seismic_viewer import (
     SpectrumScale,
     TraceSpectrum,
     TraceView,
+    ViewerTarget,
     spectrum_for_display,
 )
 from giecar_seismic.domain.geometry import LineOrientation
@@ -84,14 +86,14 @@ class SeismicViewer(QDialog):
         self,
         service: SeismicViewerService,
         build_geometry_index: GeometryIndexBuilder,
-        job_id: int,
+        target: ViewerTarget,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._service = service
         self._build_geometry_index = build_geometry_index
-        self._job_id = job_id
-        self._context = service.context(job_id)  # small repository reads only
+        self._target = target
+        self._context = service.context(target)  # small repository reads only
         self._line_numbers: list[int] = []
         self._section: SeismicSection | None = None
         self._selected: TraceView | None = None
@@ -111,10 +113,14 @@ class SeismicViewer(QDialog):
         self._thread: QThread | None = None
         self._worker: GeometryIndexWorker | SectionLoadWorker | None = None
 
+        job = self._context.job
+        subject = (
+            "preview (nothing persisted)" if self._context.preview else f"job {job.id}"
+        )
         self.setWindowTitle(
-            f"Seismic viewer -- job {job_id} ({self._context.dataset.name}, "
-            f"{FILTER_NAMES[self._context.job.filter_type]} {cutoff_summary(self._context.job)}, "
-            f"order {self._context.job.order})"
+            f"Seismic viewer -- {subject} ({self._context.dataset.name}, "
+            f"{FILTER_NAMES[job.filter_type]} {cutoff_summary(job)}, "
+            f"order {job.order})"
         )
         self.resize(1400, 800)
         self._build_ui()
@@ -326,7 +332,7 @@ class SeismicViewer(QDialog):
         self._show_selected_trace()
         self._status_label.setText(f"Loading {self.orientation.value} {line_number}...")
         worker = SectionLoadWorker(
-            self._service, self._job_id, self.orientation, line_number
+            self._service, self._target, self.orientation, line_number
         )
         worker.loaded.connect(
             lambda section: self._accept_section_result(request_id, section)
@@ -419,7 +425,7 @@ class SeismicViewer(QDialog):
         if self._section is None or self._thread is not None:
             return
         self._section_was_clicked = True
-        view = self._service.select_trace(self._job_id, self._section, coordinate)
+        view = self._service.select_trace(self._target, self._section, coordinate)
         self._selected = view
         self._selected_spectrum = (
             self._service.spectrum(view) if view is not None else None
@@ -453,10 +459,11 @@ class SeismicViewer(QDialog):
                 f"{marker.label} {marker.frequency_hz} Hz"
                 for marker in self._selected_spectrum.cutoff_markers
             )
+            subject = "Preview" if self._context.preview else f"Job {j.id}"
             self._trace_info_label.setText(
                 f"Trace {g.trace_index}  |  inline {g.inline}, crossline {g.crossline}\n"
                 f"{d.n_samples} samples @ {d.sample_rate_ms} ms  (Nyquist {d.nyquist_hz:.1f} Hz)\n"
-                f"Job {j.id}: Filter type: {FILTER_LABELS[j.filter_type]}\n"
+                f"{subject}: Filter type: {FILTER_LABELS[j.filter_type]}\n"
                 f"{cutoffs}, order {j.order}"
             )
         self.renderer.show_trace(view, self._display_spectrum)

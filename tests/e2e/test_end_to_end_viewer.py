@@ -19,7 +19,10 @@ from giecar_seismic.application.filter_jobs import (
     FilterJobService,
 )
 from giecar_seismic.application.geometry_index import BuildGeometryIndexUseCase
-from giecar_seismic.application.seismic_viewer import SeismicViewerService
+from giecar_seismic.application.seismic_viewer import (
+    FilterPreview,
+    SeismicViewerService,
+)
 from giecar_seismic.domain.geometry import LineOrientation
 from giecar_seismic.domain.job import JobStatus
 from giecar_seismic.infrastructure.database.engine import (
@@ -204,3 +207,37 @@ def test_viewer_end_to_end(world):
     assert spectrum.cutoff_hz == CUTOFF_HZ
     above = spectrum.frequencies_hz > 2 * CUTOFF_HZ
     assert spectrum.filtered[above].sum() < 0.25 * spectrum.original[above].sum()
+
+
+def test_preview_matches_the_completed_jobs_output_for_every_line(world):
+    """A preview is only useful if it shows what the job would produce:
+    the in-memory preview section (SEG-Y -> filter, no HDF5) must match
+    the section read from the finalized HDF5 of a job with the same
+    parameters, on every inline and crossline, gaps included."""
+    viewer, build_index, dataset, job, _, expected_filtered, _ = world
+    assert dataset.id is not None and job.id is not None
+    assert build_index(dataset) is True
+    preview = FilterPreview(dataset.id, CUTOFF_HZ, ORDER)
+
+    for orientation in LineOrientation:
+        for line in viewer.line_numbers(dataset.id, orientation):
+            from_hdf5 = viewer.load_section(job.id, orientation, line)
+            previewed = viewer.load_section(preview, orientation, line)
+            np.testing.assert_array_equal(
+                previewed.physical_trace_indices, from_hdf5.physical_trace_indices
+            )
+            np.testing.assert_array_equal(previewed.original, from_hdf5.original)
+            np.testing.assert_allclose(
+                previewed.filtered, from_hdf5.filtered, rtol=1e-5, atol=1e-6
+            )
+            # and both are the reference filter of the fixture amplitudes
+            present = previewed.present_mask
+            np.testing.assert_allclose(
+                previewed.filtered[present],
+                expected_filtered[previewed.physical_trace_indices[present]],
+                rtol=1e-5,
+                atol=1e-6,
+            )
+
+    # the preview never became a job
+    assert [j.id for j in viewer._jobs.list(dataset_id=dataset.id)] == [job.id]

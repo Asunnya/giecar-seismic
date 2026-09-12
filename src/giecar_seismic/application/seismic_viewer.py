@@ -6,8 +6,15 @@ from typing import Protocol
 import numpy as np
 from scipy.signal import sosfreqz
 
-from giecar_seismic.application.butterworth_filter import butterworth_sos
-from giecar_seismic.application.filter_jobs import DatasetRepository, JobRepository
+from giecar_seismic.application.butterworth_filter import (
+    apply_butterworth_filter,
+    butterworth_sos,
+)
+from giecar_seismic.application.filter_jobs import (
+    DatasetRepository,
+    JobRepository,
+    validate_filter_parameters,
+)
 from giecar_seismic.domain.dataset import SeismicDataset
 from giecar_seismic.domain.geometry import LineOrientation, TraceGeometry
 from giecar_seismic.domain.job import FilterType, Job, JobStatus
@@ -54,6 +61,28 @@ class ViewerJobNotViewableError(Exception):
     """Only a COMPLETED job with an output_path has a finalized HDF5 to
     view against its SEG-Y. (Partial CANCELLED outputs could be allowed
     later; keeping the first version's semantics simple.)"""
+
+
+@dataclass(frozen=True)
+class FilterPreview:
+    """Filter parameters to preview on a dataset *before* any job exists.
+
+    Nothing is persisted and no HDF5 is produced: the viewer applies the
+    filter in memory to the one section on screen (bounded by
+    max_section_traces x n_samples), using the same SOS design the job
+    would use, so what is shown is what run_filter_job() would write for
+    that line.
+    """
+
+    dataset_id: int
+    cutoff_hz: float
+    order: int
+    filter_type: FilterType = FilterType.LOW_PASS
+    upper_cutoff_hz: float | None = None
+
+
+# What the viewer looks at: a persisted job's output, or a preview.
+ViewerTarget = int | FilterPreview
 
 
 @dataclass(frozen=True)
@@ -144,11 +173,7 @@ class TraceSpectrum:
 
     @property
     def magnitude_label(self) -> str:
-        return (
-            "Magnitude (dB)"
-            if self.scale is SpectrumScale.DB
-            else "Magnitude"
-        )
+        return "Magnitude (dB)" if self.scale is SpectrumScale.DB else "Magnitude"
 
     @property
     def response_label(self) -> str:
@@ -203,7 +228,10 @@ def spectrum_for_display(
 @dataclass(frozen=True)
 class ViewerContext:
     dataset: SeismicDataset
+    # For a preview this is an unpersisted Job (id None) carrying only the
+    # filter parameters -- the single shape the spectrum/labels consume.
     job: Job
+    preview: bool = False
 
 
 class SeismicViewerService:
@@ -230,7 +258,10 @@ class SeismicViewerService:
         self._filtered_reader_factory = filtered_reader_factory
         self.max_section_traces = max_section_traces
 
-    def context(self, job_id: int) -> ViewerContext:
+    def context(self, target: ViewerTarget) -> ViewerContext:
+        if isinstance(target, FilterPreview):
+            return self._preview_context(target)
+        job_id = target
         job = self._jobs.get(job_id)
         if job is None:
             raise ViewerJobNotViewableError(f"job {job_id} not found")
@@ -244,15 +275,36 @@ class SeismicViewerService:
             raise ViewerJobNotViewableError(f"dataset {job.dataset_id} not found")
         return ViewerContext(dataset=dataset, job=job)
 
+    def _preview_context(self, preview: FilterPreview) -> ViewerContext:
+        dataset = self._datasets.get(preview.dataset_id)
+        if dataset is None or dataset.id is None:
+            raise ViewerJobNotViewableError(f"dataset {preview.dataset_id} not found")
+        # Same rules as create_filter_job(): raises InvalidFilterParametersError.
+        validate_filter_parameters(
+            dataset,
+            preview.cutoff_hz,
+            preview.order,
+            filter_type=preview.filter_type,
+            upper_cutoff_hz=preview.upper_cutoff_hz,
+        )
+        job = Job(
+            dataset_id=preview.dataset_id,
+            cutoff_hz=preview.cutoff_hz,
+            order=preview.order,
+            filter_type=preview.filter_type,
+            upper_cutoff_hz=preview.upper_cutoff_hz,
+        )
+        return ViewerContext(dataset=dataset, job=job, preview=True)
+
     def line_numbers(self, dataset_id: int, orientation: LineOrientation) -> list[int]:
         if orientation is LineOrientation.INLINE:
             return self._geometry.inline_numbers(dataset_id)
         return self._geometry.crossline_numbers(dataset_id)
 
     def load_section(
-        self, job_id: int, orientation: LineOrientation, line_number: int
+        self, target: ViewerTarget, orientation: LineOrientation, line_number: int
     ) -> SeismicSection:
-        ctx = self.context(job_id)
+        ctx = self.context(target)
         dataset_id = ctx.dataset.id
         assert dataset_id is not None
 
@@ -286,9 +338,21 @@ class SeismicViewerService:
             original[present_positions] = self._read(
                 self._original_reader_factory(ctx.dataset), present_indices
             )
-            filtered[present_positions] = self._read(
-                self._filtered_reader_factory(ctx.job), present_indices
-            )
+            if ctx.preview:
+                # One section only -- never the volume -- through the exact
+                # design the job would use, so the preview is faithful.
+                filtered[present_positions] = apply_butterworth_filter(
+                    original[present_positions],
+                    ctx.job.cutoff_hz,
+                    ctx.job.order,
+                    ctx.dataset.sample_rate_ms,
+                    filter_type=ctx.job.filter_type,
+                    upper_cutoff_hz=ctx.job.upper_cutoff_hz,
+                ).astype(np.float32)
+            else:
+                filtered[present_positions] = self._read(
+                    self._filtered_reader_factory(ctx.job), present_indices
+                )
 
         return SeismicSection(
             orientation=orientation,
@@ -308,7 +372,7 @@ class SeismicViewerService:
             reader.close()
 
     def select_trace(
-        self, job_id: int, section: SeismicSection, coordinate: float
+        self, target: ViewerTarget, section: SeismicSection, coordinate: float
     ) -> TraceView | None:
         """Snap a clicked coordinate to the nearest axis position. If that
         position has no physical trace (a gap), return None explicitly --
@@ -321,7 +385,7 @@ class SeismicViewerService:
         trace_index = int(section.physical_trace_indices[position])
         if trace_index < 0:
             return None
-        ctx = self.context(job_id)
+        ctx = self.context(target)
         assert ctx.dataset.id is not None
         geometry = self._geometry.get_trace(ctx.dataset.id, trace_index)
         if geometry is None:

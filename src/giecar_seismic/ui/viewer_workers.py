@@ -2,7 +2,7 @@ from collections.abc import Callable
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
-from giecar_seismic.application.seismic_viewer import SeismicViewerService
+from giecar_seismic.application.seismic_viewer import SeismicViewerService, ViewerTarget
 from giecar_seismic.domain.dataset import SeismicDataset
 from giecar_seismic.domain.geometry import LineOrientation
 
@@ -35,8 +35,9 @@ class GeometryIndexWorker(QObject):
 
 class SectionLoadWorker(QObject):
     """Loads one inline/crossline (geometry query + selective SEG-Y and
-    HDF5 reads) off the GUI thread and hands back a SeismicSection -- a
-    small value object sized to that one line, never the volume."""
+    HDF5 reads, or the in-memory preview filter of that line) off the GUI
+    thread and hands back a SeismicSection -- a small value object sized
+    to that one line, never the volume."""
 
     loaded = pyqtSignal(object)  # SeismicSection
     failed = pyqtSignal(str)
@@ -44,20 +45,20 @@ class SectionLoadWorker(QObject):
     def __init__(
         self,
         service: SeismicViewerService,
-        job_id: int,
+        target: ViewerTarget,
         orientation: LineOrientation,
         line_number: int,
     ) -> None:
         super().__init__()
         self._service = service
-        self._job_id = job_id
+        self._target = target
         self._orientation = orientation
         self._line_number = line_number
 
     def run(self) -> None:
         try:
             section = self._service.load_section(
-                self._job_id, self._orientation, self._line_number
+                self._target, self._orientation, self._line_number
             )
         except Exception as exc:  # noqa: BLE001 -- must reach the GUI as a signal
             self.failed.emit(str(exc))

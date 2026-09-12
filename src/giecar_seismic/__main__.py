@@ -7,7 +7,7 @@ from PyQt5.QtWidgets import QApplication, QWidget
 from giecar_seismic.application.dataset_import import ImportDatasetUseCase
 from giecar_seismic.application.filter_jobs import FilterJobService
 from giecar_seismic.application.geometry_index import BuildGeometryIndexUseCase
-from giecar_seismic.application.seismic_viewer import SeismicViewerService
+from giecar_seismic.application.seismic_viewer import SeismicViewerService, ViewerTarget
 from giecar_seismic.infrastructure.database.engine import (
     create_schema,
     create_sqlite_engine,
@@ -117,8 +117,8 @@ def main() -> int:
         filtered_reader_factory=open_job_output_reader,
     )
 
-    def open_viewer(job_id: int, parent: QWidget) -> QWidget:
-        return SeismicViewer(viewer_service, build_geometry_index, job_id, parent)
+    def open_viewer(target: ViewerTarget, parent: QWidget) -> QWidget:
+        return SeismicViewer(viewer_service, build_geometry_index, target, parent)
 
     app = QApplication(sys.argv)
     window = MainWindow(

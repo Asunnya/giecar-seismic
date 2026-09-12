@@ -345,7 +345,7 @@ class FakeViewerService:
 
 def _open(qapp, wait_for_signal):
     service = FakeViewerService()
-    viewer = SeismicViewer(service, lambda d: True, job_id=7)
+    viewer = SeismicViewer(service, lambda d: True, target=7)
     for _ in range(2):
         thread = viewer._thread
         assert thread is not None
