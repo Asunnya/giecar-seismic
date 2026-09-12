@@ -66,6 +66,9 @@ class FakeTraceWriter:
     def write_chunk(self, start: int, chunk: np.ndarray) -> None:
         self.written.append((start, chunk))
 
+    def checkpoint(self) -> None:
+        pass  # In-memory writer has no pending disk buffers.
+
     def finalize(self) -> None:
         self.finalized = True
 
@@ -78,6 +81,9 @@ class RaisingWriteChunkTraceWriter:
 
     def write_chunk(self, start: int, chunk: np.ndarray) -> None:
         raise OSError("disk full")
+
+    def checkpoint(self) -> None:
+        pass  # In-memory writer has no pending disk buffers.
 
     def finalize(self) -> None:
         pass

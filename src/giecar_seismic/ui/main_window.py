@@ -142,6 +142,7 @@ class MainWindow(QMainWindow):
         self._history_thread: QThread | None = None
         self._history_worker: JobHistoryWorker | None = None
         self._table_jobs: list[Job] = []
+        self._dataset_trace_counts: dict[int, int] = {}
         self._dataset_labels: dict[int, str] = {}  # dataset id -> file name
 
         self.setWindowTitle("GIECAR Seismic Filter")
@@ -302,6 +303,11 @@ class MainWindow(QMainWindow):
         self._open_output_button.setEnabled(False)
         self._open_output_button.clicked.connect(self._on_open_output_clicked)
         layout.addWidget(self._open_output_button)
+
+        self._resume_button = QPushButton("Resume", group)
+        self._resume_button.setEnabled(False)
+        self._resume_button.clicked.connect(self._on_resume_clicked)
+        layout.addWidget(self._resume_button)
 
         self._view_output_button = QPushButton("View Output", group)
         self._view_output_button.setEnabled(False)
@@ -478,6 +484,7 @@ class MainWindow(QMainWindow):
         importing = self._import_thread is not None
         self._run_button.setEnabled(self._can_run() and not running and not importing)
         self._cancel_button.setEnabled(running)
+        self._refresh_output_buttons()
         self._select_segy_button.setEnabled(
             self._dataset_importer is not None and not importing and not running
         )
@@ -508,12 +515,23 @@ class MainWindow(QMainWindow):
             return
         self._register_session_dataset(dataset)
         self._insert_job_row(0, job)  # newest first, like the persisted history
-        assert job.id is not None
+        self._start_job_worker(job, resume=False)
+
+    def _on_resume_clicked(self) -> None:
+        if not self._can_resume():
+            return
+        job = self._selected_job()
+        assert job is not None
+        self._start_job_worker(job, resume=True)
+
+    def _start_job_worker(self, job: Job, *, resume: bool) -> None:
+        service = self._service
+        assert service is not None and job.id is not None
         self._current_job_id = job.id
 
         cancel_token = CooperativeCancelToken()
         thread = QThread(self)
-        worker = FilterJobWorker(service, job.id, cancel_token)
+        worker = FilterJobWorker(service, job.id, cancel_token, resume=resume)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
@@ -544,8 +562,8 @@ class MainWindow(QMainWindow):
         self._thread = thread
         self._worker = worker
 
-        self._status_label.setText("Running...")
-        self._progress_bar.setValue(0)
+        self._status_label.setText("Resuming..." if resume else "Running...")
+        self._progress_bar.setValue(round(job.progress) if resume else 0)
         self._refresh_controls()
 
         thread.start()
@@ -671,6 +689,7 @@ class MainWindow(QMainWindow):
         worker = JobHistoryWorker(self._service, dataset_id, status)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
+        worker.trace_counts_ready.connect(self._on_trace_counts_loaded)
         worker.succeeded.connect(self._on_history_loaded)
         worker.failed.connect(self._on_history_failed)
         worker.succeeded.connect(thread.quit)
@@ -684,6 +703,9 @@ class MainWindow(QMainWindow):
         self._history_loaded_once = True
         self._set_history_controls_enabled(False)
         thread.start()
+
+    def _on_trace_counts_loaded(self, counts: dict[int, int]) -> None:
+        self._dataset_trace_counts.update(counts)
 
     def _on_history_loaded(self, jobs: list[Job], labels: dict[int, str]) -> None:
         # Newest first: created_at, then id as a deterministic tie-break.
@@ -713,6 +735,7 @@ class MainWindow(QMainWindow):
         """Label the current dataset before its first job row appears; the
         next history load replaces this with the worker's labels."""
         assert dataset.id is not None
+        self._dataset_trace_counts[dataset.id] = dataset.n_traces
         if dataset.id in self._dataset_labels:
             return
         label = dataset_labels({dataset.id: dataset})[dataset.id]
@@ -787,7 +810,23 @@ class MainWindow(QMainWindow):
         job = self._selected_job()
         return job.output_path if job is not None else None
 
+    def _can_resume(self) -> bool:
+        job = self._selected_job()
+        return (
+            self._service is not None
+            and self._thread is None
+            and self._import_thread is None
+            and job is not None
+            and job.status is JobStatus.CANCELLED
+            and job.output_path is not None
+            and 0
+            <= job.processed_traces
+            < self._dataset_trace_counts.get(job.dataset_id, 0)
+            and Path(job.output_path).is_file()
+        )
+
     def _refresh_output_buttons(self) -> None:
+        self._resume_button.setEnabled(self._can_resume())
         self._open_output_button.setEnabled(self._selected_output_path() is not None)
         self._view_output_button.setEnabled(
             self._selected_viewable_job_id() is not None

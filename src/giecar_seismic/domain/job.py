@@ -46,6 +46,36 @@ class Job:
     filter_type: FilterType = FilterType.LOW_PASS
     upper_cutoff_hz: float | None = None
 
+    processed_traces: int = 0
+    resume_count: int = 0
+
+    def __post_init__(self) -> None:
+        for name in ("processed_traces", "resume_count"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+
+    def resume(self) -> None:
+        """Creativity track's sole additional transition; preserve logical start."""
+        self._transition("resume", JobStatus.CANCELLED, JobStatus.RUNNING)
+        self.finished_at = None
+        self.resume_count += 1
+
+    def record_checkpoint(self, processed_traces: int, total_traces: int) -> None:
+        """Record a confirmed durable prefix, never a rounded percentage."""
+        if self.status is not JobStatus.RUNNING:
+            raise InvalidTransitionError("checkpoint requires a RUNNING job")
+        if (
+            type(processed_traces) is not int
+            or total_traces <= 0
+            or not self.processed_traces <= processed_traces <= total_traces
+        ):
+            raise ValueError(
+                "processed_traces must be monotonic and within trace count"
+            )
+        self.advance_progress(100 * processed_traces / total_traces)
+        self.processed_traces = processed_traces
+
     def _transition(
         self, action: str, expected: JobStatus, new_status: JobStatus
     ) -> None:

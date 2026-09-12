@@ -38,15 +38,23 @@ class FilterJobWorker(QObject):
         service: FilterJobService,
         job_id: int,
         cancel_token: CooperativeCancelToken,
+        *,
+        resume: bool = False,
     ) -> None:
         super().__init__()
         self._service = service
         self._job_id = job_id
         self._cancel_token = cancel_token
+        self._resume = resume
 
     def run(self) -> None:
         try:
-            job = self._service.run_filter_job(
+            operation = (
+                self._service.resume_filter_job
+                if self._resume
+                else self._service.run_filter_job
+            )
+            job = operation(
                 self._job_id,
                 progress_callback=self.progress.emit,
                 cancel_token=self._cancel_token,
@@ -127,6 +135,7 @@ class JobHistoryWorker(QObject):
     display label per dataset id (file name) -- small metadata objects
     only. Never touches a QWidget."""
 
+    trace_counts_ready = pyqtSignal(object)  # dataset id -> physical trace count
     succeeded = pyqtSignal(object, object)  # list[Job], dict[int, str]
     failed = pyqtSignal(str)
 
@@ -154,4 +163,5 @@ class JobHistoryWorker(QObject):
         except Exception as exc:  # noqa: BLE001 -- any failure must reach the GUI via a signal
             self.failed.emit(str(exc))
             return
+        self.trace_counts_ready.emit({i: d.n_traces for i, d in found.items()})
         self.succeeded.emit(jobs, labels)

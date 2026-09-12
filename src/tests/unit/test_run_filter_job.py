@@ -97,6 +97,9 @@ class FakeTraceWriter:
     def write_chunk(self, start: int, chunk: np.ndarray) -> None:
         self.written.append((start, chunk))
 
+    def checkpoint(self) -> None:
+        pass  # In-memory writer has no pending disk buffers.
+
     def finalize(self) -> None:
         self.calls.append("finalize")
         self.finalized = True
@@ -122,6 +125,9 @@ class WriteChunkRaisingTraceWriter:
     def write_chunk(self, start: int, chunk: np.ndarray) -> None:
         raise OSError("disk full")
 
+    def checkpoint(self) -> None:
+        pass  # In-memory writer has no pending disk buffers.
+
     def finalize(self) -> None:
         self.finalized = True
 
@@ -145,6 +151,9 @@ class FinalizeRaisingTraceWriter:
 
     def write_chunk(self, start: int, chunk: np.ndarray) -> None:
         self.written.append((start, chunk))
+
+    def checkpoint(self) -> None:
+        pass  # In-memory writer has no pending disk buffers.
 
     def finalize(self) -> None:
         self.calls.append("finalize")
@@ -191,6 +200,9 @@ class CloseRaisingTraceWriter:
     def write_chunk(self, start: int, chunk: np.ndarray) -> None:
         self.written.append((start, chunk))
 
+    def checkpoint(self) -> None:
+        pass  # In-memory writer has no pending disk buffers.
+
     def finalize(self) -> None:
         self.finalized = True
 
@@ -213,6 +225,9 @@ class WriteChunkAndCloseRaisingTraceWriter:
 
     def write_chunk(self, start: int, chunk: np.ndarray) -> None:
         raise OSError("disk full")
+
+    def checkpoint(self) -> None:
+        pass  # In-memory writer has no pending disk buffers.
 
     def finalize(self) -> None:
         self.finalized = True
@@ -822,6 +837,9 @@ class BlockingLastChunkTraceWriter:
             self._about_to_check.set()
             assert self._resume.wait(timeout=5), "test deadlocked: resume never set"
 
+    def checkpoint(self) -> None:
+        pass  # In-memory writer has no pending disk buffers.
+
     def finalize(self) -> None:
         self.finalized = True
 
@@ -888,6 +906,9 @@ class BlockingFinalizeTraceWriter:
 
     def write_chunk(self, start: int, chunk: np.ndarray) -> None:
         self.written.append((start, chunk))
+
+    def checkpoint(self) -> None:
+        pass  # In-memory writer has no pending disk buffers.
 
     def finalize(self) -> None:
         self._finalize_started.set()

@@ -23,7 +23,10 @@ from giecar_seismic.infrastructure.segy.reader import (
     open_dataset_reader,
 )
 from giecar_seismic.infrastructure.storage.hdf5_reader import open_job_output_reader
-from giecar_seismic.infrastructure.storage.hdf5_writer import make_hdf5_writer_factory
+from giecar_seismic.infrastructure.storage.hdf5_writer import (
+    make_hdf5_writer_factory,
+    open_hdf5_resume_writer,
+)
 from giecar_seismic.ui.main_window import MainWindow
 from giecar_seismic.ui.seismic_viewer import SeismicViewer
 
@@ -54,6 +57,7 @@ def main() -> int:
         jobs=jobs,
         reader_factory=open_dataset_reader,
         writer_factory=make_hdf5_writer_factory(DEFAULT_OUTPUTS_DIR),
+        resume_writer_factory=open_hdf5_resume_writer,
     )
 
     # Viewer: geometry index (built lazily, in bounded batches, on first

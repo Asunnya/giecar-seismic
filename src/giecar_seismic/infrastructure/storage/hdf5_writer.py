@@ -90,6 +90,88 @@ class Hdf5TraceWriter:
         self._file.attrs["written_trace_count"] = 0
         self._file.attrs["complete"] = False
 
+    @classmethod
+    def open_for_resume(
+        cls,
+        output_path: str | Path,
+        expected_trace_count: int,
+        n_samples: int,
+        *,
+        allow_complete: bool = False,
+    ) -> Self:
+        """Open in r+, validating metadata only; never read or copy amplitudes.
+
+        allow_complete is reserved for post-finalize reconciliation. Such a
+        writer is immutable: neither write_chunk nor finalize is permitted.
+        """
+        writer = cls.__new__(cls)
+        writer._file = h5py.File(output_path, "r+")
+        try:
+            attrs = writer._file.attrs
+
+            def integer(name: str) -> int:
+                value = attrs.get(name)
+                if isinstance(value, (bool, np.bool_)) or not isinstance(
+                    value, (int, np.integer)
+                ):
+                    raise Hdf5WriterError(f"invalid {name} checkpoint attribute")
+                return int(value)
+
+            expected = integer("expected_trace_count")
+            samples = integer("n_samples")
+            written = integer("written_trace_count")
+            complete = attrs.get("complete")
+            traces = writer._file.get(TRACES_DATASET_NAME)
+            if not isinstance(complete, (bool, np.bool_)):
+                raise Hdf5WriterError("invalid complete checkpoint attribute")
+            if expected != expected_trace_count or expected <= 0:
+                raise Hdf5WriterError("incompatible expected_trace_count")
+            if samples != n_samples or samples <= 0:
+                raise Hdf5WriterError("incompatible n_samples")
+            if not 0 <= written <= expected:
+                raise Hdf5WriterError("written_trace_count outside expected bounds")
+            if not isinstance(traces, h5py.Dataset) or traces.shape != (
+                written,
+                samples,
+            ):
+                raise Hdf5WriterError(
+                    "traces shape disagrees with written_trace_count/n_samples"
+                )
+            if traces.chunks is None or traces.maxshape != (expected, samples):
+                raise Hdf5WriterError("traces is not a compatible extensible dataset")
+            if complete and (not allow_complete or written != expected):
+                raise Hdf5WriterError("complete output is not a resumable partial file")
+            writer._traces = traces
+            writer._expected_trace_count = expected
+            writer._n_samples = samples
+            writer._dtype = traces.dtype
+            writer._written = written
+            writer._closed = False
+            writer._finalized = bool(complete)
+            writer._output_path = str(output_path)
+            return writer
+        except BaseException:
+            writer._file.close()
+            raise
+
+    @property
+    def written_trace_count(self) -> int:
+        return self._written
+
+    @property
+    def is_complete(self) -> bool:
+        return self._finalized
+
+    def checkpoint(self) -> None:
+        """Flush amplitudes and their prefix marker before SQLite can advance.
+
+        HDF5 flush provides reopen visibility, not a cross-store transaction
+        or a guarantee against storage hardware/power failure.
+        """
+        if self._closed or self._finalized:
+            raise Hdf5WriterError("cannot checkpoint a closed or finalized writer")
+        self._file.flush()
+
     @property
     def output_path(self) -> str:
         return self._output_path
@@ -205,3 +287,11 @@ def make_hdf5_writer_factory(
         )
 
     return factory
+
+
+def open_hdf5_resume_writer(job: Job, dataset: SeismicDataset) -> Hdf5TraceWriter:
+    if job.output_path is None:
+        raise Hdf5WriterError("resume requires an existing output_path")
+    return Hdf5TraceWriter.open_for_resume(
+        job.output_path, dataset.n_traces, dataset.n_samples, allow_complete=True
+    )

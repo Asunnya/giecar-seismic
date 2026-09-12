@@ -5,6 +5,7 @@ from typing import Protocol
 import numpy as np
 
 from giecar_seismic.application.butterworth_filter import apply_butterworth_filter
+from giecar_seismic.application.dataset_import import read_source_fingerprint
 from giecar_seismic.domain.dataset import SeismicDataset
 from giecar_seismic.domain.job import FilterType, InvalidTransitionError, Job, JobStatus
 
@@ -43,6 +44,10 @@ class TraceWriter(Protocol):
 
     def write_chunk(self, start: int, chunk: np.ndarray) -> None: ...
 
+    def checkpoint(self) -> None:
+        """Flush the written prefix before its count is committed to SQLite."""
+        ...
+
     def finalize(self) -> None:
         """Mark the output as semantically complete and valid.
 
@@ -62,6 +67,22 @@ class TraceWriter(Protocol):
         writer-side cleanup that runs.
         """
         ...
+
+
+class ResumeTraceWriter(TraceWriter, Protocol):
+    @property
+    def written_trace_count(self) -> int: ...
+
+    @property
+    def is_complete(self) -> bool: ...
+
+
+class CheckpointInconsistentError(Exception):
+    """Resume cannot safely establish a durable physical checkpoint."""
+
+
+class SourceChangedError(Exception):
+    """The source no longer matches its persisted identity or sample metadata."""
 
 
 class CancelToken(Protocol):
@@ -115,6 +136,7 @@ ReaderFactory = Callable[[SeismicDataset], TraceReader]
 # trace to size its output; run_filter_job() already holds the dataset,
 # so it is passed in rather than re-fetched from the repository.
 WriterFactory = Callable[[Job, SeismicDataset], TraceWriter]
+ResumeWriterFactory = Callable[[Job, SeismicDataset], ResumeTraceWriter]
 ProgressCallback = Callable[[float], None]
 
 
@@ -198,7 +220,12 @@ class FilterJobService:
         reader_factory: ReaderFactory | None = None,
         writer_factory: WriterFactory | None = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
+        *,
+        resume_writer_factory: ResumeWriterFactory | None = None,
     ):
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        self._resume_writer_factory = resume_writer_factory
         self._datasets = datasets
         self._jobs = jobs
         self._reader_factory = reader_factory
@@ -357,10 +384,38 @@ class FilterJobService:
         progress_callback: ProgressCallback,
         cancel_token: CancelToken,
     ) -> Job:
-        if self._reader_factory is None or self._writer_factory is None:
+        return self._execute_filter_job(
+            job_id, progress_callback, cancel_token, resume=False
+        )
+
+    def resume_filter_job(
+        self,
+        job_id: int,
+        progress_callback: ProgressCallback,
+        cancel_token: CancelToken,
+    ) -> Job:
+        """Explicit creativity extension: continue only a CANCELLED job."""
+        return self._execute_filter_job(
+            job_id, progress_callback, cancel_token, resume=True
+        )
+
+    def _execute_filter_job(
+        self,
+        job_id: int,
+        progress_callback: ProgressCallback,
+        cancel_token: CancelToken,
+        *,
+        resume: bool,
+    ) -> Job:
+        if self._reader_factory is None or (
+            self._resume_writer_factory is None
+            if resume
+            else self._writer_factory is None
+        ):
+            required_writer = "resume_writer_factory" if resume else "writer_factory"
             raise RuntimeError(
-                "FilterJobService requires reader_factory and writer_factory "
-                "to run a filter job"
+                f"FilterJobService requires reader_factory and {required_writer} "
+                "to execute a filter job"
             )
 
         # Claim exclusive ownership of this job id *before* doing anything
@@ -388,8 +443,14 @@ class FilterJobService:
             if dataset is None:
                 raise DatasetNotFoundError(f"dataset {job.dataset_id} not found")
 
-            job.start()
-            self._jobs.update(job)
+            if resume:
+                if job.status is not JobStatus.CANCELLED:
+                    raise InvalidTransitionError(
+                        f"cannot resume a job in status {job.status}"
+                    )
+            else:
+                job.start()
+                self._jobs.update(job)
 
             reader: TraceReader | None = None
             writer: TraceWriter | None = None
@@ -400,6 +461,15 @@ class FilterJobService:
                 # reader/writer themselves -- must still resolve to a
                 # terminal job state and never leak whichever of the two
                 # resources did get created.
+                if resume:
+                    fingerprint = read_source_fingerprint(dataset.source_path)
+                    if (
+                        dataset.source_fingerprint is None
+                        or fingerprint != dataset.source_fingerprint
+                    ):
+                        raise SourceChangedError(
+                            "SEG-Y fingerprint missing or changed since import"
+                        )
                 reader = self._reader_factory(dataset)
                 trace_count = reader.trace_count
                 # The reader re-opens the file; the dataset carries the
@@ -412,15 +482,54 @@ class FilterJobService:
                         f"{dataset.id} was imported with {dataset.n_traces}"
                     )
 
-                writer = self._writer_factory(job, dataset)
-                # The output exists (possibly empty) from this point on:
-                # record where it lives before processing a single chunk,
-                # so a FAILED/CANCELLED job still points at its partial
-                # file. If the factory raised, output_path stays None.
-                job.output_path = writer.output_path
-                self._jobs.update(job)
+                start_trace = 0
+                already_complete = False
+                if resume:
+                    if getattr(reader, "sample_count", None) != dataset.n_samples:
+                        raise SourceChangedError(
+                            "SEG-Y sample count differs from Dataset"
+                        )
+                    if (
+                        getattr(reader, "sample_rate_ms", None)
+                        != dataset.sample_rate_ms
+                    ):
+                        raise SourceChangedError(
+                            "SEG-Y sample interval differs from Dataset"
+                        )
+                    assert self._resume_writer_factory is not None
+                    try:
+                        resumed_writer = self._resume_writer_factory(job, dataset)
+                    except Exception as exc:
+                        raise CheckpointInconsistentError(
+                            f"Cannot open resume checkpoint: {exc}"
+                        ) from exc
+                    writer = resumed_writer
+                    start_trace = resumed_writer.written_trace_count
+                    already_complete = resumed_writer.is_complete
+                    if (
+                        type(start_trace) is not int
+                        or not 0 <= job.processed_traces <= start_trace <= trace_count
+                        or (already_complete and start_trace != trace_count)
+                        or writer.output_path != job.output_path
+                    ):
+                        raise CheckpointInconsistentError(
+                            f"SQLite processed_traces={job.processed_traces}, "
+                            f"HDF5 written_trace_count={start_trace}: incompatible checkpoint"
+                        )
+                    job.resume()
+                    # Percent is presentation only. Reconcile from the physical
+                    # prefix even if an older stored percentage was rounded.
+                    job.progress = 100 * start_trace / trace_count
+                    job.record_checkpoint(start_trace, trace_count)
+                    self._jobs.update(job)
+                    progress_callback(round(job.progress))
+                else:
+                    assert self._writer_factory is not None
+                    writer = self._writer_factory(job, dataset)
+                    job.output_path = writer.output_path
+                    self._jobs.update(job)
 
-                for start in range(0, trace_count, self._chunk_size):
+                for start in range(start_trace, trace_count, self._chunk_size):
                     if cancel_token.is_cancelled():
                         job.cancel()
                         return job
@@ -439,7 +548,8 @@ class FilterJobService:
                     # Progress is processed / *physical* trace_count (from
                     # the reader), never n_inlines * n_crosslines. One
                     # repository write per chunk, not per trace.
-                    job.advance_progress(100 * stop / trace_count)
+                    writer.checkpoint()
+                    job.record_checkpoint(stop, trace_count)
                     self._jobs.update(job)
                     progress_callback(round(100 * stop / trace_count))
 
@@ -468,9 +578,12 @@ class FilterJobService:
                     job.cancel()
                     return job
 
-                writer.finalize()
+                if not already_complete:
+                    writer.finalize()
                 job.complete()
-            except Exception as exc:  # noqa: BLE001 -- any failure must FAIL the job, not crash the worker
+            except Exception as exc:
+                if job.status is not JobStatus.RUNNING:
+                    raise  # failed resume validation leaves CANCELLED retryable
                 job.fail(str(exc))
             finally:
                 # Ownership: whoever created a resource here is

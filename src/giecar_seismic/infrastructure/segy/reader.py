@@ -24,6 +24,14 @@ class SegyTraceReader:
         self.trace_count: int = self._segy.tracecount
         self._sample_count = len(self._segy.samples)
 
+    @property
+    def sample_count(self) -> int:
+        return self._sample_count
+
+    @property
+    def sample_rate_ms(self) -> float:
+        return float(segyio.tools.dt(self._segy)) / 1000
+
     def read_chunk(self, start: int, stop: int) -> np.ndarray:
         if start < 0:
             raise ValueError("start must be non-negative")

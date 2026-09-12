@@ -44,7 +44,8 @@ single-pass magnitude response for every filter type.
 Processing still reads bounded chunks, filters, writes HDF5 incrementally, reports
 progress and observes cooperative cancellation at existing boundaries. Job
 finalization, partial-output handling and geometry indexing retain their existing
-behavior. No resume or multiprocessing is implemented.
+behavior. Resume uses the durable chunk checkpoints described below; multiprocessing
+is not implemented.
 
 ## Spectrum and viewer
 
@@ -114,9 +115,94 @@ Observed click-to-first-completed-Qt-paint times: **PyQtGraph 45–52 ms** (thre
 openings), **Matplotlib 96 ms** (one opening). These are local observations, not a
 pytest benchmark or a guarantee for other machines.
 
+## Resuming a cancelled job (creativity track)
+
+Select a **CANCELLED** job in the history and click **Resume**. Eligibility uses
+its saved trace count and the presence of its output file, without opening HDF5
+on the GUI thread. The button requires `processed_traces < dataset.n_traces`.
+Run and Resume share the existing QThread lifecycle and are mutually exclusive;
+Cancel remains cooperative. Progress starts from the saved value and is then
+reconciled by the worker. The service can also finish a fully checkpointed
+cancelled job even though the history button is intentionally disabled at 100%.
+
+`resume_filter_job(job_id, progress_callback, cancel_token)` explicitly continues
+the **same** job and output path. `run_filter_job()` remains initial execution.
+The state machine is `CREATED -> RUNNING -> COMPLETED / FAILED / CANCELLED`,
+plus the creativity track's single additional transition:
+`CANCELLED --resume()--> RUNNING`. FAILED and COMPLETED cannot resume. There is
+no automatic recovery/transition of a stranded RUNNING job after a process crash.
+`created_at` and the original `started_at` are preserved; resume increments
+`resume_count`, clears `finished_at`, and subsequent termination records a new end.
+
+### Durable checkpoint and reconciliation
+
+Each chunk follows this order:
+
+`read -> Butterworth -> write_chunk -> HDF5 checkpoint/flush -> processed_traces
+-> progress -> SQLite commit -> progress callback`.
+
+`processed_traces` is an exact integer prefix length; percentage is derived as
+`100 * processed_traces / dataset.n_traces`. It never locates a checkpoint.
+The HDF5 `traces` shape is `(written_trace_count, n_samples)`, with attributes
+`expected_trace_count`, `n_samples`, `written_trace_count`, and `complete`.
+`checkpoint()` flushes amplitudes and the prefix metadata before SQLite advances.
+This provides reopen visibility, not an atomic distributed transaction or a
+power-loss guarantee beyond HDF5/filesystem behavior.
+
+Resume opens the same HDF5 in **r+**, validates shape/counts/completeness, and reads
+only metadata. It never copies, refilters or rewrites the existing prefix.
+The SEG-Y is reopened and checked against the imported size/mtime fingerprint,
+physical trace count, sample count and interval. Missing fingerprints are rejected;
+size/mtime detects ordinary replacement but is not a cryptographic identity check.
+
+- **HDF5 = SQLite:** continue at that trace index.
+- **HDF5 > SQLite:** reconcile SQLite and progress to the durable HDF5 prefix.
+- **SQLite > HDF5**, malformed/missing output, or changed source: reject explicitly
+  before entering RUNNING. `CheckpointInconsistentError` identifies unsafe output
+  checkpoints; source validation has separate clear errors. No automatic truncation.
+- **Full prefix, complete=False:** finalize and complete without filtering.
+- **Full prefix, complete=True:** reconcile the CANCELLED job to COMPLETED without
+  writing/finalizing the file again. Incomplete data marked complete is rejected.
+
+The loop starts at `written_trace_count`, retaining configurable chunk size,
+bounded memory, execution registration and the existing point of no return.
+A resumed execution can be cancelled again. Runtime processing/checkpoint failures
+still produce FAILED; preflight rejection leaves CANCELLED unchanged.
+
+### Decision record
+
+**Context:** Seismic processing may take hours and datasets can exceed 25 GB.
+Restarting from zero wastes CPU and I/O; incremental writes already provide a
+natural checkpoint boundary.
+
+**Decision:** Choose resume as the creativity track: continue the same CANCELLED
+job from its last durably stored physical trace, with HDF5 as prefix authority.
+
+**Alternatives:** Restarting is simpler but repeats expensive work. Percentage
+progress loses exact trace boundaries through rounding and says nothing about
+whether amplitudes were flushed. A distributed transaction or attempts/event
+model would add unnecessary scope for this challenge.
+
+**Trade-offs:** Flush each chunk, accept its I/O cost, and explicitly reconcile two
+stores. Reject ambiguous/corrupt checkpoints instead of guessing or rolling back.
+
+**Consequences:** Repeated cancellation/resume preserves work with bounded memory
+and numerically identical output; schema changes and consistency tests are required.
+
+### Local checkpoint cost measurement
+
+A manual pipeline benchmark compared the preceding implementation with this one:
+real SEG-Y -> Butterworth -> HDF5, plus SQLite writes; 4096 traces x 2048 samples,
+256 traces/chunk (16 checkpoints). After one warm-up pair, five alternating runs
+had medians **190.6 ms before** and **189.3 ms after** (-0.7%). The observed cost
+was indistinguishable from local timing/page-cache variation, not evidence that
+flush is free on larger datasets or slower disks. No performance threshold is
+asserted by pytest.
+
 ## Development database schema change
 
-Jobs now persist `filter_type` as the enum **name** (`LOW_PASS`, `HIGH_PASS`,
+Jobs additionally persist non-null integer `processed_traces` and `resume_count`,
+both defaulting to zero. Jobs also persist `filter_type` as the enum **name** (`LOW_PASS`, `HIGH_PASS`,
 `BAND_PASS`) and nullable `upper_cutoff_hz`. New/default jobs use `LOW_PASS` and
 `NULL`. `create_schema()` only creates missing tables; it does **not** migrate
 existing ones. No database is deleted or updated automatically.
@@ -129,10 +215,14 @@ a reviewed manual update is:
 ```sql
 ALTER TABLE jobs ADD COLUMN filter_type VARCHAR NOT NULL DEFAULT 'LOW_PASS';
 ALTER TABLE jobs ADD COLUMN upper_cutoff_hz FLOAT;
+ALTER TABLE jobs ADD COLUMN processed_traces INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN resume_count INTEGER NOT NULL DEFAULT 0;
 ```
 
 Apply this only if those columns are absent. Older schema differences require
-separate review. Alternatively, deliberately move the old development database
+separate review. Never backfill `processed_traces` from a percentage: eligible old
+partial files must pass HDF5/source validation and reconcile their physical prefix.
+Alternatively, deliberately move the old development database
 aside and let startup create a fresh one; existing HDF5 outputs are not removed.
 
 ## Validation
@@ -142,3 +232,10 @@ for all three types, invalid parameters, three small real SEG-Y→HDF5 round tri
 persistence, common-reference dB/floor behavior, theoretical response, dynamic UI,
 and equivalent renderer data. UI tests run headlessly via the shared Qt fixtures;
 assertions inspect behavior and data, not pixels.
+
+Resume tests additionally cover timestamp/state transitions, durable prefix
+visibility, metadata rejection, exact read/filter/write boundaries, repeated
+cancellation, concurrent execution rejection, both final-chunk crash windows,
+HDF5/SQLite divergence, source replacement, and GUI worker routing. The real
+irregular SEG-Y E2E closes/reopens SQLite and HDF5 between attempts and compares
+the final amplitudes both to the scientific function and an uninterrupted pipeline.

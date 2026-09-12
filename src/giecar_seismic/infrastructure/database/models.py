@@ -65,6 +65,12 @@ class JobModel(Base):
     order: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False)
     error_message: Mapped[str | None] = mapped_column(String, nullable=True)
+    processed_traces: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    resume_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     progress: Mapped[float] = mapped_column(Float, nullable=False)
     output_path: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

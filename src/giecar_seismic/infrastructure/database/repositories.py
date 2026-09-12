@@ -79,6 +79,8 @@ def _job_to_domain(model: JobModel) -> Job:
         status=JobStatus[model.status],
         error_message=model.error_message,
         progress=model.progress,
+        processed_traces=model.processed_traces,
+        resume_count=model.resume_count,
         output_path=model.output_path,
         created_at=model.created_at,
         started_at=model.started_at,
@@ -97,6 +99,8 @@ def _job_to_model(job: Job) -> JobModel:
         status=job.status.name,
         error_message=job.error_message,
         progress=job.progress,
+        processed_traces=job.processed_traces,
+        resume_count=job.resume_count,
         output_path=job.output_path,
         created_at=job.created_at,
         started_at=job.started_at,
@@ -162,6 +166,8 @@ class SqlAlchemyJobRepository:
             model.status = job.status.name
             model.error_message = job.error_message
             model.progress = job.progress
+            model.processed_traces = job.processed_traces
+            model.resume_count = job.resume_count
             model.output_path = job.output_path
             model.started_at = job.started_at
             model.finished_at = job.finished_at
