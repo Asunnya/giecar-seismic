@@ -297,3 +297,56 @@ def test_dataset_and_job_survive_fresh_repositories_over_the_same_database(db_pa
     assert fetched_job.status is JobStatus.RUNNING
     assert fetched_job.cutoff_hz == 30.0
     assert fetched_job.order == 4
+
+
+# --- Integration: real SEG-Y -> use case -> SQLite -> reopen ----------------
+
+
+def test_import_use_case_persists_a_real_segy_and_survives_reopening(db_path, tmp_path):
+    import numpy as np
+    import segyio
+
+    from giecar_seismic.application.dataset_import import ImportDatasetUseCase
+    from giecar_seismic.infrastructure.segy.dataset_importer import (
+        import_segy_dataset,
+    )
+
+    # 3x3 grid with one position missing: 8 physical traces, not 9.
+    segy_path = tmp_path / "survey.segy"
+    inlines = [10, 10, 10, 11, 11, 12, 12, 12]
+    crosslines = [1, 2, 3, 1, 2, 1, 2, 3]
+    spec = segyio.spec()
+    spec.samples = list(range(5))
+    spec.tracecount = len(inlines)
+    spec.format = 5
+    with segyio.create(str(segy_path), spec) as segy:
+        for i, (inline, crossline) in enumerate(zip(inlines, crosslines)):
+            segy.trace[i] = np.zeros(5, dtype=np.float32)
+            segy.header[i][segyio.TraceField.INLINE_3D] = inline
+            segy.header[i][segyio.TraceField.CROSSLINE_3D] = crossline
+        segy.bin[segyio.BinField.Interval] = 4000
+
+    engine = create_sqlite_engine(db_path)
+    create_schema(engine)
+    import_dataset = ImportDatasetUseCase(
+        import_segy_dataset, SqlAlchemyDatasetRepository(make_session_factory(engine))
+    )
+
+    imported = import_dataset(str(segy_path), "survey")
+    assert imported.id is not None
+    engine.dispose()
+
+    fresh = SqlAlchemyDatasetRepository(
+        make_session_factory(create_sqlite_engine(db_path))
+    )
+    fetched = fresh.get(imported.id)
+
+    assert fetched is not None
+    assert fetched.name == "survey"
+    assert fetched.source_path == str(segy_path)
+    assert fetched.n_inlines == 3
+    assert fetched.n_crosslines == 3
+    assert fetched.n_traces == 8
+    assert fetched.n_traces != fetched.n_inlines * fetched.n_crosslines
+    assert fetched.n_samples == 5
+    assert fetched.sample_rate_ms == 4.0

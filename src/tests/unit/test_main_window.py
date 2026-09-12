@@ -594,7 +594,7 @@ def test_select_segy_disabled_and_ignored_while_a_filter_job_is_running(
     )
     writer = FakeTraceWriter()
     service = _build_service(dataset, reader, writer, chunk_size=1)
-    window = MainWindow(service=service)
+    window = MainWindow(service=service, dataset_importer=lambda path, name: dataset)
     window.set_dataset(dataset)
 
     window._run_button.click()
@@ -615,3 +615,53 @@ def test_select_segy_disabled_and_ignored_while_a_filter_job_is_running(
     wait_for_signal(thread_ref.finished)
 
     assert window._select_segy_button.isEnabled() is True
+
+
+# --- Import delivers a persisted dataset -------------------------------
+
+
+def test_main_window_imports_no_sqlalchemy_or_infrastructure():
+    # Check actual import statements, not prose: the UI must reach
+    # persistence and SEG-Y reading only through the injected callable.
+    import_lines = [
+        line.strip()
+        for line in inspect.getsource(main_window_module).splitlines()
+        if line.startswith(("import ", "from "))
+    ]
+    assert not any("sqlalchemy" in line for line in import_lines)
+    assert not any("giecar_seismic.infrastructure" in line for line in import_lines)
+
+
+def test_select_segy_is_disabled_when_no_importer_is_composed(qapp):
+    window = MainWindow(dataset_importer=None)
+
+    assert window._select_segy_button.isEnabled() is False
+
+
+def test_successful_import_delivers_a_persisted_dataset_with_id_to_the_ui(
+    qapp, wait_for_signal, monkeypatch
+):
+    from dataclasses import replace
+
+    persisted = replace(_dataset(), id=42)
+    importer_thread_names: list[str] = []
+
+    def full_importer(source_path: str, name: str) -> SeismicDataset:
+        # what production wires here is ImportDatasetUseCase (read + persist);
+        # the window only ever sees the callable and the persisted result.
+        importer_thread_names.append(threading.current_thread().name)
+        return persisted
+
+    window = MainWindow(dataset_importer=full_importer)
+    monkeypatch.setattr(window, "_prompt_for_segy_path", lambda: "/data/survey.segy")
+
+    window._select_segy_button.click()
+    thread_ref = window._import_thread
+    assert thread_ref is not None
+    wait_for_signal(thread_ref.finished)
+
+    assert window._dataset is persisted
+    assert window._dataset.id == 42
+    assert window._traces_label.text() == str(persisted.n_traces)
+    # the importer ran off the GUI thread (this test's thread)
+    assert importer_thread_names != [threading.current_thread().name]

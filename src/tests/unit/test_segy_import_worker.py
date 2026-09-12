@@ -1,4 +1,7 @@
 import inspect
+from dataclasses import replace
+
+import pytest
 
 from giecar_seismic.domain.dataset import SeismicDataset
 from giecar_seismic.ui.workers import SegyImportWorker
@@ -64,11 +67,28 @@ def test_worker_emits_failed_when_the_importer_raises():
     assert failures == ["not a valid SEG-Y file"]
 
 
-def test_worker_defaults_to_the_real_import_segy_dataset():
-    from giecar_seismic.infrastructure.segy.dataset_importer import (
-        import_segy_dataset,
+def test_worker_requires_an_importer_and_knows_no_infrastructure():
+    # The importer is injected -- the worker has no default wired to
+    # segyio, SQLAlchemy or any repository, so it can't reach either on
+    # its own.
+    import giecar_seismic.ui.workers as workers_module
+
+    source = inspect.getsource(workers_module)
+    assert "sqlalchemy" not in source.lower()
+    assert "import_segy_dataset" not in source
+    with pytest.raises(TypeError):
+        SegyImportWorker("/data/survey.segy", "survey")  # type: ignore[call-arg]
+
+
+def test_worker_delivers_the_persisted_dataset_with_its_id():
+    persisted = replace(_fake_dataset(), id=7)
+    worker = SegyImportWorker(
+        "/data/survey.segy", "survey", importer=lambda path, name: persisted
     )
+    succeeded: list[SeismicDataset] = []
+    worker.succeeded.connect(succeeded.append)
 
-    worker = SegyImportWorker("/data/survey.segy", "survey")
+    worker.run()
 
-    assert worker._importer is import_segy_dataset
+    assert succeeded == [persisted]
+    assert succeeded[0].id == 7

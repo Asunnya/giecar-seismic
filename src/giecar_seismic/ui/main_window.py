@@ -26,7 +26,6 @@ from giecar_seismic.application.filter_jobs import (
 )
 from giecar_seismic.domain.dataset import SeismicDataset
 from giecar_seismic.domain.job import Job
-from giecar_seismic.infrastructure.segy.dataset_importer import import_segy_dataset
 from giecar_seismic.ui.workers import DatasetImporter, FilterJobWorker, SegyImportWorker
 
 JOBS_TABLE_HEADERS = ["id", "cutoff (Hz)", "order", "status"]
@@ -40,12 +39,16 @@ class MainWindow(QMainWindow):
     """First vertical slice of the desktop UI: Dataset -> Filter ->
     Processing -> Jobs, wired to run a single filter job on a QThread.
 
-    `service` is accepted by construction rather than composed here: the
-    SQLAlchemy-backed repositories and the SEG-Y-backed reader/writer
-    factories this needs for a real end-to-end run don't exist yet. With
-    `service=None` (the entrypoint's current default) the window still
-    opens and displays correctly, but "Run Filter" stays disabled -- an
-    explicit, visible incomplete composition rather than a fake demo.
+    Dependencies are accepted by construction rather than composed here.
+    `dataset_importer` is the full import (read SEG-Y metadata + persist
+    to SQLite -- application.dataset_import.ImportDatasetUseCase in
+    production), so the dataset that arrives via set_dataset() already
+    carries its persistent id; this window never touches a repository or
+    SQLAlchemy itself. `service` is still not composed by the entrypoint
+    (the SEG-Y/HDF5 reader/writer factories it needs for a real run
+    aren't wired yet), so "Run Filter" stays disabled -- an explicit,
+    visible incomplete composition rather than a fake demo. Either
+    dependency left as None disables the corresponding control.
 
     Selecting a SEG-Y file records its path and starts a background
     import (see SegyImportWorker) that reads trace headers and produces a
@@ -60,7 +63,7 @@ class MainWindow(QMainWindow):
     def __init__(
         self,
         service: FilterJobService | None = None,
-        dataset_importer: DatasetImporter = import_segy_dataset,
+        dataset_importer: DatasetImporter | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -176,9 +179,11 @@ class MainWindow(QMainWindow):
 
         return group
 
-    # -- Dataset wiring: Select SEG-Y -> QThread -> import_segy_dataset --
+    # -- Dataset wiring: Select SEG-Y -> QThread -> dataset importer ------
 
     def _on_select_segy_clicked(self) -> None:
+        if self._dataset_importer is None:
+            return  # no importer composed: the button is disabled too
         if self._import_thread is not None or self._thread is not None:
             # An import is already running, or a filter job is: ignore
             # (the button is disabled in both cases too). Never let a new
@@ -206,6 +211,7 @@ class MainWindow(QMainWindow):
         self._dataset = None
         self._clear_dataset_labels()
 
+        assert self._dataset_importer is not None
         name = Path(path).stem
         thread = QThread(self)
         worker = SegyImportWorker(path, name, importer=self._dataset_importer)
@@ -286,10 +292,10 @@ class MainWindow(QMainWindow):
     # -- Run / Cancel ----------------------------------------------------
 
     def _can_run(self) -> bool:
-        # dataset.id is None until the dataset is actually persisted
-        # (SQLAlchemy integration lands later) -- create_filter_job()
-        # needs a real dataset_id, so a not-yet-persisted dataset must
-        # never make Run available. No id is invented here.
+        # dataset.id is None for a dataset that was never persisted (e.g.
+        # one handed to set_dataset() directly) -- create_filter_job()
+        # needs a real dataset_id, so such a dataset must never make Run
+        # available. No id is invented here.
         return (
             self._service is not None
             and self._dataset is not None
@@ -301,7 +307,9 @@ class MainWindow(QMainWindow):
         importing = self._import_thread is not None
         self._run_button.setEnabled(self._can_run() and not running and not importing)
         self._cancel_button.setEnabled(running)
-        self._select_segy_button.setEnabled(not importing and not running)
+        self._select_segy_button.setEnabled(
+            self._dataset_importer is not None and not importing and not running
+        )
 
     def _on_run_clicked(self) -> None:
         if not self._can_run() or self._thread is not None:

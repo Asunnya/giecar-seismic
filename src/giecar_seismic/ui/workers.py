@@ -8,8 +8,11 @@ from giecar_seismic.application.filter_jobs import (
 )
 from giecar_seismic.domain.dataset import SeismicDataset
 from giecar_seismic.domain.job import Job, JobStatus
-from giecar_seismic.infrastructure.segy.dataset_importer import import_segy_dataset
 
+# Full import: read SEG-Y metadata *and* persist -- returns a
+# SeismicDataset with a real id. In production this is
+# application.dataset_import.ImportDatasetUseCase; tests pass plain
+# functions. The worker deliberately doesn't know which.
 DatasetImporter = Callable[[str, str], SeismicDataset]
 
 
@@ -63,16 +66,17 @@ class FilterJobWorker(QObject):
 
 
 class SegyImportWorker(QObject):
-    """Runs import_segy_dataset() off the GUI thread.
+    """Runs a dataset import (read SEG-Y metadata + persist) off the GUI
+    thread.
 
     Reading SEG-Y trace headers (INLINE_3D/CROSSLINE_3D across every
-    trace) is I/O that scales with trace count, not sample count -- it
-    must not block the GUI thread even though it never touches trace
-    amplitudes. The SEG-Y path and dataset name are received by
-    construction; the importer function itself is injected too (default:
-    the real import_segy_dataset), so tests can supply a fake importer
-    without touching a real file. Never touches a QWidget -- talks back
-    exclusively through signals.
+    trace) is I/O that scales with trace count -- it must not block the
+    GUI thread even though it never touches trace amplitudes; the
+    SQLite write that follows must not either. The SEG-Y path, dataset
+    name and the importer callable are all received by construction: the
+    worker knows nothing about segyio, sessions, engines or ORM models,
+    and tests supply a plain function. Never touches a QWidget -- talks
+    back exclusively through signals.
     """
 
     succeeded = pyqtSignal(object)  # SeismicDataset
@@ -82,7 +86,7 @@ class SegyImportWorker(QObject):
         self,
         source_path: str,
         name: str,
-        importer: DatasetImporter = import_segy_dataset,
+        importer: DatasetImporter,
     ) -> None:
         super().__init__()
         self._source_path = source_path
