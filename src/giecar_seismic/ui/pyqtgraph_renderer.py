@@ -1,8 +1,9 @@
 import time
+from collections.abc import Sequence
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtCore import QRectF
+from PyQt5.QtCore import QRectF, Qt
 from PyQt5.QtWidgets import QVBoxLayout, QWidget
 
 from giecar_seismic.application.seismic_viewer import (
@@ -51,6 +52,8 @@ class PyQtGraphSeismicRenderer(SeismicRenderer):
         layout.addWidget(self._layout_widget)
         self._plots: list[pg.PlotItem] = []
         self._images: list[pg.ImageItem] = []
+        self._compare_lines: list[tuple[pg.PlotItem, pg.InfiniteLine]] = []
+        self.last_compare_markers: tuple[float, ...] = ()
         self._layout_widget.scene().sigMouseClicked.connect(self._on_scene_clicked)
 
         self._analysis_panel = QWidget()
@@ -92,7 +95,9 @@ class PyQtGraphSeismicRenderer(SeismicRenderer):
     ) -> None:
         started = time.perf_counter()
         self.last_panels = []
-        self._layout_widget.clear()
+        self._layout_widget.clear()  # drops every item, markers included
+        self._compare_lines.clear()
+        self.last_compare_markers = ()
         self._plots, self._images = [], []
         if section is None:
             return
@@ -176,19 +181,37 @@ class PyQtGraphSeismicRenderer(SeismicRenderer):
         scene_pos = getattr(event, "scenePos", lambda: None)()
         if scene_pos is None:
             return
+        modifiers = getattr(event, "modifiers", lambda: Qt.KeyboardModifier(0))()
+        compare = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
         for plot in self._plots:
             view_box = plot.getViewBox()
             if view_box.sceneBoundingRect().contains(scene_pos):
-                self.coordinate_clicked.emit(
-                    float(view_box.mapSceneToView(scene_pos).x())
-                )
+                self._emit_click(float(view_box.mapSceneToView(scene_pos).x()), compare)
                 return
 
-    def click_at_coordinate(self, coordinate: float) -> None:
-        """Programmatic equivalent of a click at x=coordinate on the first
-        panel (used by tests; goes through the same signal)."""
+    def _emit_click(self, coordinate: float, compare: bool) -> None:
+        if compare:
+            self.compare_coordinate_clicked.emit(coordinate)
+        else:
+            self.coordinate_clicked.emit(coordinate)
+
+    def click_at_coordinate(self, coordinate: float, *, compare: bool = False) -> None:
+        """Programmatic equivalent of a (Ctrl-)click at x=coordinate on the
+        first panel (used by tests; goes through the same signals)."""
         if self._plots:
-            self.coordinate_clicked.emit(float(coordinate))
+            self._emit_click(float(coordinate), compare)
+
+    def show_compare_markers(self, coordinates: Sequence[float]) -> None:
+        for plot, line in self._compare_lines:
+            plot.removeItem(line)
+        self._compare_lines.clear()
+        pen = pg.mkPen("#00a000", style=Qt.PenStyle.DashLine, width=1)
+        for plot in self._plots:
+            for coordinate in coordinates:
+                line = pg.InfiniteLine(pos=float(coordinate), angle=90, pen=pen)
+                plot.addItem(line)
+                self._compare_lines.append((plot, line))
+        self.last_compare_markers = tuple(float(c) for c in coordinates)
 
     @staticmethod
     def _draw_wiggle(

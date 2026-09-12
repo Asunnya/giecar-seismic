@@ -14,6 +14,13 @@ handed. Switching renderer disposes the old one, builds the new one and
 redraws the section/trace/spectrum already in memory: no worker, no
 SEG-Y/HDF5 read, no repository query, no FFT.
 
+Two selections coexist: the *active* trace (click; right-hand panel and
+the single-trace SpectrumWindow) and the *comparison set* (Ctrl+click;
+physical trace indices of the current section, capped at
+MAX_COMPARE_TRACES) whose aggregate spectrum opens in the modeless
+CompareSpectrumWindow. Both are computed from the section already in
+memory; the comparison set is cleared whenever the section changes.
+
 Threading: every load (geometry index build, section read) runs on a
 QThread via the workers in viewer_workers.py; this dialog only receives
 small value objects through signals and draws them. Navigation is
@@ -52,6 +59,7 @@ from giecar_seismic.application.seismic_viewer import (
     spectrum_for_display,
 )
 from giecar_seismic.domain.geometry import LineOrientation
+from giecar_seismic.ui.compare_spectrum_window import CompareSpectrumWindow
 from giecar_seismic.ui.filter_labels import FILTER_LABELS, FILTER_NAMES, cutoff_summary
 from giecar_seismic.ui.matplotlib_renderer import MatplotlibSeismicRenderer
 from giecar_seismic.ui.pyqtgraph_renderer import PyQtGraphSeismicRenderer
@@ -70,6 +78,11 @@ from giecar_seismic.ui.viewer_workers import (
 )
 
 log = logging.getLogger(__name__)
+
+# Upper bound of the Ctrl+click comparison set: a UI/performance guardrail
+# (that many single-trace FFTs on the GUI thread, that many markers), not
+# a scientific statement about how many traces an ensemble needs.
+MAX_COMPARE_TRACES = 16
 
 
 def make_renderer(name: str) -> SeismicRenderer:
@@ -101,6 +114,10 @@ class SeismicViewer(QDialog):
         self._display_spectrum: TraceSpectrum | None = None
         self._renderer: SeismicRenderer | None = None
         self._spectrum_window: SpectrumWindow | None = None
+        # Comparison set, separate from `_selected`: ordered, unique
+        # physical trace indices, all present in `_section`.
+        self._compare_indices: list[int] = []
+        self._compare_window: CompareSpectrumWindow | None = None
         self._section_request_id = 0
         self._pending_section_request: int | None = None
         self._section_was_clicked = False
@@ -225,6 +242,21 @@ class SeismicViewer(QDialog):
         self._open_spectrum_button.setEnabled(False)
         self._open_spectrum_button.clicked.connect(self._open_spectrum)
         trace_layout.addWidget(self._open_spectrum_button)
+        # Comparison set: only a count and a button, hidden until used.
+        self._compare_label = QLabel("", self)
+        self._compare_label.setToolTip(
+            f"Ctrl+click traces on the section (up to {MAX_COMPARE_TRACES}) "
+            "to compare their aggregate spectra."
+        )
+        self._compare_label.hide()
+        trace_layout.addWidget(self._compare_label)
+        self._compare_button = QPushButton("Compare Spectra", self)
+        self._compare_button.setToolTip(
+            "Mean of the selected traces' amplitude spectra, original vs filtered."
+        )
+        self._compare_button.hide()
+        self._compare_button.clicked.connect(self._open_compare)
+        trace_layout.addWidget(self._compare_button)
         self._analysis_slot = QVBoxLayout()
         trace_layout.addLayout(self._analysis_slot, 1)
 
@@ -337,6 +369,7 @@ class SeismicViewer(QDialog):
         self._selected_spectrum = None
         self._display_spectrum = None
         self._show_selected_trace()
+        self._clear_compare_selection()
         self._status_label.setText(f"Loading {self.orientation.value} {line_number}...")
         worker = SectionLoadWorker(
             self._service, self._target, self.orientation, line_number
@@ -361,6 +394,7 @@ class SeismicViewer(QDialog):
         self._selected_spectrum = None
         self._display_spectrum = None
         self._section_was_clicked = False
+        self._clear_compare_selection()
         self._status_label.setText(
             f"{section.orientation.value.capitalize()} {section.line_number}: "
             f"{section.n_present_traces} traces on a {len(section.coordinates)}-position axis, "
@@ -381,9 +415,13 @@ class SeismicViewer(QDialog):
         exists at a time -- the previous one is disposed first."""
         if self._renderer is not None:
             self._renderer.coordinate_clicked.disconnect(self.select_coordinate)
+            self._renderer.compare_coordinate_clicked.disconnect(
+                self.toggle_compare_coordinate
+            )
             self._renderer.dispose()
         self._renderer = renderer
         renderer.coordinate_clicked.connect(self.select_coordinate)
+        renderer.compare_coordinate_clicked.connect(self.toggle_compare_coordinate)
         self._splitter.insertWidget(0, renderer.section_widget())
         self._analysis_slot.addWidget(renderer.analysis_widget())
         self._splitter.setStretchFactor(0, 3)
@@ -419,6 +457,7 @@ class SeismicViewer(QDialog):
 
     def _redraw(self, *_args: object) -> None:
         self.renderer.show_section(self._section, self.display_settings())
+        self.renderer.show_compare_markers(self._compare_coordinates())
         if self._section is not None:
             log.debug(
                 "%s rendered %s %s in %.1f ms",
@@ -438,6 +477,103 @@ class SeismicViewer(QDialog):
             self._service.spectrum(view) if view is not None else None
         )
         self._on_spectrum_settings_changed()
+
+    # -- comparison set (Ctrl+click; section in memory only) --------------------
+
+    @property
+    def compare_indices(self) -> tuple[int, ...]:
+        return tuple(self._compare_indices)
+
+    def toggle_compare_coordinate(self, coordinate: float) -> None:
+        """Add/remove the physical trace nearest to `coordinate` in the
+        comparison set. Resolved on the in-memory section: no service,
+        geometry or repository call. Gaps and off-axis clicks are ignored."""
+        section = self._section
+        if section is None or self._thread is not None:
+            return
+        position = section.position_for_coordinate(coordinate)
+        if position is None:
+            return
+        trace_index = int(section.physical_trace_indices[position])
+        if trace_index < 0:
+            return
+        limit_hit = False
+        if trace_index in self._compare_indices:
+            self._compare_indices.remove(trace_index)
+        elif len(self._compare_indices) >= MAX_COMPARE_TRACES:
+            limit_hit = True
+        else:
+            self._compare_indices.append(trace_index)
+        self._refresh_compare_ui(limit_hit=limit_hit)
+
+    def _clear_compare_selection(self) -> None:
+        if not self._compare_indices and self._compare_window is None:
+            return
+        self._compare_indices.clear()
+        self._refresh_compare_ui()
+
+    def _compare_coordinates(self) -> list[float]:
+        section = self._section
+        if section is None or not self._compare_indices:
+            return []
+        index_to_coordinate = {
+            int(index): float(coordinate)
+            for index, coordinate in zip(
+                section.physical_trace_indices, section.coordinates, strict=True
+            )
+            if index >= 0
+        }
+        return [index_to_coordinate[i] for i in self._compare_indices]
+
+    def _refresh_compare_ui(self, *, limit_hit: bool = False) -> None:
+        count = len(self._compare_indices)
+        if count == 0:
+            self._compare_label.hide()
+        else:
+            noun = "trace" if count == 1 else "traces"
+            text = f"{count} {noun} selected"
+            if limit_hit:
+                text += f" -- Limit of {MAX_COMPARE_TRACES} traces reached"
+            self._compare_label.setText(text)
+            self._compare_label.show()
+        self._compare_button.setText(f"Compare Spectra ({count})")
+        self._compare_button.setVisible(count >= 2)
+        self._compare_button.setEnabled(count >= 2)
+        if self._renderer is not None:
+            self._renderer.show_compare_markers(self._compare_coordinates())
+        if self._compare_window is not None:
+            # The window shows the aggregate of a selection that no longer
+            # exists: empty it rather than display stale curves.
+            self._compare_window.set_aggregate(None)
+
+    def _open_compare(self) -> None:
+        section = self._section
+        if section is None or len(self._compare_indices) < 2:
+            return
+        # A handful of single-trace FFTs on rows already in memory: synchronous.
+        aggregate = self._service.aggregate_spectrum(
+            section,
+            list(self._compare_indices),
+            self._context.dataset,
+            self._context.job,
+        )
+        if self._compare_window is None:
+            window = CompareSpectrumWindow(
+                aggregate, self, renderer_name=self._renderer_combo.currentText()
+            )
+            self._compare_window = window
+            window.finished.connect(self._on_compare_window_closed)
+        else:
+            self._compare_window.set_aggregate(aggregate)
+        self._compare_window.show()
+        self._compare_window.raise_()
+        self._compare_window.activateWindow()
+
+    def _on_compare_window_closed(self, _result: int) -> None:
+        window = self._compare_window
+        if window is not None:
+            window.finished.disconnect(self._on_compare_window_closed)
+            self._compare_window = None
 
     def _on_spectrum_settings_changed(self, *_args: object) -> None:
         self._display_spectrum = (
@@ -523,8 +659,13 @@ class SeismicViewer(QDialog):
             return
         if self._spectrum_window is not None:
             self._spectrum_window.close()
+        if self._compare_window is not None:
+            self._compare_window.close()
         if self._renderer is not None:
             self._renderer.coordinate_clicked.disconnect(self.select_coordinate)
+            self._renderer.compare_coordinate_clicked.disconnect(
+                self.toggle_compare_coordinate
+            )
             self._renderer.dispose()
             self._renderer = None
         event.accept()

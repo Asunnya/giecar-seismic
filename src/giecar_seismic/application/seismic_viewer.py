@@ -125,6 +125,18 @@ class SeismicSection:
     def n_present_traces(self) -> int:
         return int(self.present_mask.sum())
 
+    def position_for_coordinate(self, coordinate: float) -> int | None:
+        """Snap a clicked coordinate to the nearest axis position, or None
+        when the click is outside the axis (> 0.5 from every position).
+        Pure: resolving the position to a physical trace is the caller's
+        decision (it may be a gap, index -1)."""
+        if self.coordinates.size == 0:
+            return None
+        position = int(np.argmin(np.abs(self.coordinates - coordinate)))
+        if abs(float(self.coordinates[position]) - coordinate) > 0.5:
+            return None
+        return position
+
 
 @dataclass(frozen=True)
 class TraceView:
@@ -222,6 +234,52 @@ def spectrum_for_display(
         scale=scale,
         show_filter_response=show_filter_response,
         reference_magnitude=reference,
+    )
+
+
+@dataclass(frozen=True)
+class AggregateSpectrum:
+    """Ensemble QC over a few traces of one loaded section.
+
+    `spectrum.original` / `spectrum.filtered` are, per frequency bin, the
+    arithmetic mean of the per-trace linear amplitude spectra
+    (TRACE -> FFT -> |.| -> mean), never the spectrum of the averaged traces:
+    time-domain averaging lets neighbouring traces cancel by phase and
+    misrepresents the frequency content. Reusing TraceSpectrum as the array
+    container is what gives this the exact same Linear/dB rules and
+    renderers as a single trace; it is not a TraceView and has no geometry
+    of its own beyond the selected identities.
+    """
+
+    METHOD = "Mean of per-trace amplitude spectra"
+
+    spectrum: TraceSpectrum
+    trace_indices: tuple[int, ...]  # physical, in selection order
+    coordinates: tuple[int, ...]  # axis coordinate of each selected trace
+    orientation: LineOrientation
+    line_number: int
+    dataset: SeismicDataset
+    job: Job
+
+    @property
+    def n_traces(self) -> int:
+        return len(self.trace_indices)
+
+
+def aggregate_for_display(
+    aggregate: AggregateSpectrum,
+    scale: SpectrumScale,
+    *,
+    show_filter_response: bool = False,
+) -> AggregateSpectrum:
+    """Same Linear/dB transform as a single trace, applied to the already
+    aggregated linear magnitudes (dB after aggregation, never a mean of
+    dB values). No FFT; the raw aggregate is never mutated."""
+    return replace(
+        aggregate,
+        spectrum=spectrum_for_display(
+            aggregate.spectrum, scale, show_filter_response=show_filter_response
+        ),
     )
 
 
@@ -377,10 +435,8 @@ class SeismicViewerService:
         """Snap a clicked coordinate to the nearest axis position. If that
         position has no physical trace (a gap), return None explicitly --
         never silently the next neighbour."""
-        if section.coordinates.size == 0:
-            return None
-        position = int(np.argmin(np.abs(section.coordinates - coordinate)))
-        if abs(float(section.coordinates[position]) - coordinate) > 0.5:
+        position = section.position_for_coordinate(coordinate)
+        if position is None:
             return None  # clicked outside the axis
         trace_index = int(section.physical_trace_indices[position])
         if trace_index < 0:
@@ -401,24 +457,83 @@ class SeismicViewerService:
 
     @staticmethod
     def spectrum(view: TraceView) -> TraceSpectrum:
-        fs_hz = 1000 / view.dataset.sample_rate_ms
-        n = view.original.shape[0]
-        frequencies = np.fft.rfftfreq(n, d=1 / fs_hz)
-        sos = butterworth_sos(
-            view.job.cutoff_hz,
-            view.job.order,
-            view.dataset.sample_rate_ms,
-            filter_type=view.job.filter_type,
-            upper_cutoff_hz=view.job.upper_cutoff_hz,
+        return _linear_spectrum(
+            np.abs(np.fft.rfft(view.original)),
+            np.abs(np.fft.rfft(view.filtered)),
+            n_samples=view.original.shape[0],
+            dataset=view.dataset,
+            job=view.job,
         )
-        _, response = sosfreqz(sos, worN=frequencies, fs=fs_hz)
-        return TraceSpectrum(
-            frequencies_hz=frequencies,
-            original=np.abs(np.fft.rfft(view.original)),
-            filtered=np.abs(np.fft.rfft(view.filtered)),
-            nyquist_hz=fs_hz / 2,
-            cutoff_hz=view.job.cutoff_hz,
-            filter_type=view.job.filter_type,
-            upper_cutoff_hz=view.job.upper_cutoff_hz,
-            filter_response=np.abs(response) ** 2,
+
+    @staticmethod
+    def aggregate_spectrum(
+        section: SeismicSection,
+        trace_indices: Sequence[int],
+        dataset: SeismicDataset,
+        job: Job,
+    ) -> AggregateSpectrum:
+        """Mean of per-trace amplitude spectra for `trace_indices` (physical
+        identities present in `section`). Reads only the section's rows for
+        those traces -- no I/O, memory bounded by len(trace_indices) spectra.
+        """
+        indices = [int(i) for i in trace_indices]
+        if not indices:
+            raise ValueError("aggregate_spectrum needs at least one trace")
+        if len(set(indices)) != len(indices):
+            raise ValueError(f"duplicate trace indices in {indices}")
+        positions = []
+        for index in indices:
+            matches = np.flatnonzero(section.physical_trace_indices == index)
+            if index < 0 or matches.size == 0:
+                raise ValueError(f"trace {index} is not in the section")
+            positions.append(int(matches[0]))
+        original = np.abs(np.fft.rfft(section.original[positions], axis=-1))
+        filtered = np.abs(np.fft.rfft(section.filtered[positions], axis=-1))
+        return AggregateSpectrum(
+            spectrum=_linear_spectrum(
+                original.mean(axis=0),
+                filtered.mean(axis=0),
+                n_samples=section.n_samples,
+                dataset=dataset,
+                job=job,
+            ),
+            trace_indices=tuple(indices),
+            coordinates=tuple(int(section.coordinates[p]) for p in positions),
+            orientation=section.orientation,
+            line_number=section.line_number,
+            dataset=dataset,
+            job=job,
         )
+
+
+def _linear_spectrum(
+    original: np.ndarray,
+    filtered: np.ndarray,
+    *,
+    n_samples: int,
+    dataset: SeismicDataset,
+    job: Job,
+) -> TraceSpectrum:
+    """Shared tail of the single-trace and aggregate paths: the rfft
+    frequency axis and ONE theoretical zero-phase response from the job's
+    SOS (|H|^2), whatever the number of traces behind the magnitudes."""
+    fs_hz = 1000 / dataset.sample_rate_ms
+    frequencies = np.fft.rfftfreq(n_samples, d=1 / fs_hz)
+    sos = butterworth_sos(
+        job.cutoff_hz,
+        job.order,
+        dataset.sample_rate_ms,
+        filter_type=job.filter_type,
+        upper_cutoff_hz=job.upper_cutoff_hz,
+    )
+    _, response = sosfreqz(sos, worN=frequencies, fs=fs_hz)
+    return TraceSpectrum(
+        frequencies_hz=frequencies,
+        original=original,
+        filtered=filtered,
+        nyquist_hz=fs_hz / 2,
+        cutoff_hz=job.cutoff_hz,
+        filter_type=job.filter_type,
+        upper_cutoff_hz=job.upper_cutoff_hz,
+        filter_response=np.abs(response) ** 2,
+    )

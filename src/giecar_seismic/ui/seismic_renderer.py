@@ -8,6 +8,7 @@ Renderers never read SEG-Y/HDF5, never query a repository and never run
 off the GUI thread. Switching renderer therefore never touches data.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from math import ceil
 
@@ -67,6 +68,10 @@ class SeismicRenderer(QObject):
     # number in inline view, inline number in crossline view). Resolving
     # it to a physical trace stays in the viewer/service, never here.
     coordinate_clicked = pyqtSignal(float)
+    # Same coordinate, Ctrl-modified: toggle the trace in the viewer's
+    # comparison set. Each renderer maps its own library's modifier
+    # semantics onto this signal, so nothing keyboard-specific leaves it.
+    compare_coordinate_clicked = pyqtSignal(float)
 
     def section_widget(self) -> QWidget:
         raise NotImplementedError
@@ -85,6 +90,12 @@ class SeismicRenderer(QObject):
     ) -> None:
         raise NotImplementedError
 
+    def show_compare_markers(self, coordinates: Sequence[float]) -> None:
+        """Mark the comparison-selected coordinates on every section panel
+        (lightweight vertical lines). The viewer owns the selection and
+        re-applies it after each show_section(), which clears markers."""
+        raise NotImplementedError
+
     def dispose(self) -> None:
         """Release widgets and disconnect anything that could keep drawing."""
         raise NotImplementedError
@@ -94,6 +105,7 @@ class SeismicRenderer(QObject):
     last_spectrum: TraceSpectrum | None
     last_panels: list[PanelRender]
     last_render_seconds: float
+    last_compare_markers: tuple[float, ...]
 
 
 # --- shared display math ----------------------------------------------------

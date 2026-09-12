@@ -1,9 +1,11 @@
 import time
+from collections.abc import Sequence
 
 import numpy as np
 from matplotlib.axes import Axes
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 from PyQt5.QtWidgets import QVBoxLayout, QWidget
 
 from giecar_seismic.application.seismic_viewer import (
@@ -61,6 +63,8 @@ class MatplotlibSeismicRenderer(SeismicRenderer):
 
         self._images: list = []  # reusable imshow artists, one per panel
         self._images_key: tuple[int, str] | None = None  # (n_panels, cmap)
+        self._compare_lines: list[Line2D] = []
+        self.last_compare_markers: tuple[float, ...] = ()
 
     # -- SeismicRenderer ----------------------------------------------------
 
@@ -75,6 +79,7 @@ class MatplotlibSeismicRenderer(SeismicRenderer):
     ) -> None:
         started = time.perf_counter()
         self.last_panels = []
+        self._clear_compare_markers()
         if section is None:
             self._section_figure.clear()
             self._images, self._images_key = [], None
@@ -169,7 +174,38 @@ class MatplotlibSeismicRenderer(SeismicRenderer):
         xdata = getattr(event, "xdata", None)
         if xdata is None or self._toolbar.mode:
             return
+        # matplotlib reports the held modifier as the event's `key`
+        if getattr(event, "key", None) == "control":
+            self.compare_coordinate_clicked.emit(float(xdata))
+            return
         self.coordinate_clicked.emit(float(xdata))
+
+    def click_at_coordinate(self, coordinate: float, *, compare: bool = False) -> None:
+        """Programmatic equivalent of a (Ctrl-)click at x=coordinate (used
+        by tests; goes through the same signals as _on_click)."""
+        if compare:
+            self.compare_coordinate_clicked.emit(float(coordinate))
+        else:
+            self.coordinate_clicked.emit(float(coordinate))
+
+    def show_compare_markers(self, coordinates: Sequence[float]) -> None:
+        self._clear_compare_markers()
+        for ax in self._section_figure.axes:
+            for coordinate in coordinates:
+                line = ax.axvline(
+                    coordinate, color="#00a000", linestyle="--", linewidth=0.8
+                )
+                line.set_gid("compare-marker")
+                self._compare_lines.append(line)
+        self.last_compare_markers = tuple(float(c) for c in coordinates)
+        self._section_canvas.draw_idle()
+
+    def _clear_compare_markers(self) -> None:
+        for line in self._compare_lines:
+            if line.axes is not None:  # figure.clear() may have removed it
+                line.remove()
+        self._compare_lines.clear()
+        self.last_compare_markers = ()
 
     @staticmethod
     def _draw_wiggle(

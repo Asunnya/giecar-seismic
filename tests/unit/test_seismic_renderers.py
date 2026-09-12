@@ -6,6 +6,7 @@ is presentation-only -- no service call, no worker, no I/O, state kept.
 
 import inspect
 import threading
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -305,6 +306,104 @@ def test_each_renderer_emits_the_clicked_coordinate_only(renderer):
         renderer.click_at_coordinate(2.3)
 
     assert clicked == [2.3]  # resolving to a physical trace is the viewer's job
+
+
+# --- comparison set: Ctrl+click and markers ------------------------------------------
+
+
+def test_ctrl_click_emits_only_the_compare_signal(renderer):
+    renderer.show_section(_section(), SETTINGS)
+    clicked: list[float] = []
+    compared: list[float] = []
+    renderer.coordinate_clicked.connect(clicked.append)
+    renderer.compare_coordinate_clicked.connect(compared.append)
+
+    if isinstance(renderer, MatplotlibSeismicRenderer):
+
+        class Plain:
+            xdata = 1.2
+
+        class Ctrl:
+            xdata = 2.3
+            key = "control"
+
+        renderer._on_click(Plain())
+        renderer._on_click(Ctrl())
+    else:
+        renderer.click_at_coordinate(1.2)
+        renderer.click_at_coordinate(2.3, compare=True)
+
+    # keyboard semantics stay inside the renderer: the viewer only sees two signals
+    assert clicked == [1.2]
+    assert compared == [2.3]
+
+
+def _marker_lines(renderer):
+    """Library-specific count of drawn comparison markers (all panels)."""
+    if isinstance(renderer, MatplotlibSeismicRenderer):
+        return [
+            line
+            for ax in renderer.section_figure.axes
+            for line in ax.lines
+            if line.get_gid() == "compare-marker"
+        ]
+    import pyqtgraph as pg
+
+    return [
+        item
+        for plot in renderer.plots
+        for item in plot.items
+        if isinstance(item, pg.InfiniteLine)
+    ]
+
+
+@pytest.mark.parametrize("mode", ["Original", "Side-by-side"])
+def test_compare_markers_are_drawn_per_panel_and_cleared(renderer, mode):
+    section = _section()
+    renderer.show_section(section, replace(SETTINGS, mode=mode))
+    n_panels = 2 if mode == "Side-by-side" else 1
+
+    renderer.show_compare_markers([1.0, 3.0])
+
+    assert renderer.last_compare_markers == (1.0, 3.0)
+    lines = _marker_lines(renderer)
+    assert len(lines) == 2 * n_panels
+    xs = sorted(
+        {
+            float(line.get_xdata()[0])
+            if isinstance(renderer, MatplotlibSeismicRenderer)
+            else float(line.value())
+            for line in lines
+        }
+    )
+    assert xs == [1.0, 3.0]
+
+    renderer.show_compare_markers([3.0])  # selection shrank: redrawn, not appended
+    assert renderer.last_compare_markers == (3.0,)
+    assert len(_marker_lines(renderer)) == n_panels
+
+    renderer.show_compare_markers([])
+    assert renderer.last_compare_markers == ()
+    assert _marker_lines(renderer) == []
+
+    renderer.show_compare_markers([2.0])
+    renderer.show_section(section, replace(SETTINGS, mode=mode))  # a new section
+    assert renderer.last_compare_markers == ()  # the viewer re-applies its own state
+    assert _marker_lines(renderer) == []
+    renderer.show_section(None, SETTINGS)
+    assert _marker_lines(renderer) == []
+
+
+def test_both_renderers_record_identical_compare_markers(qapp):
+    mpl, pg = MatplotlibSeismicRenderer(), PyQtGraphSeismicRenderer()
+    try:
+        for r in (mpl, pg):
+            r.show_section(_section(), SETTINGS)
+            r.show_compare_markers([2.0, 4.0])
+        assert mpl.last_compare_markers == pg.last_compare_markers == (2.0, 4.0)
+    finally:
+        mpl.dispose()
+        pg.dispose()
 
 
 # --- viewer integration: switching renderer ----------------------------------------

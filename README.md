@@ -48,6 +48,12 @@ original × filtrado no visualizador (animação em 2× de velocidade).
 - Espectro do traço selecionado em escala linear ou dB, com frequências de corte
   e resposta teórica do filtro.
 - Janela de Spectrum maior e não modal, sincronizada com a seleção do viewer.
+- **QC espectral multi-traço:** `Ctrl+clique` na seção adiciona/remove traços
+  (até 16, limite de UI, não científico) em um conjunto de comparação
+  independente do traço ativo; o botão **Compare Spectra (N)** abre uma janela
+  não modal com **uma** curva agregada original e **uma** filtrada — a média,
+  bin a bin, dos espectros de amplitude de cada traço (ver decisão abaixo). Usa
+  só a seção já carregada: sem leitura de SEG-Y/HDF5/SQLite e sem worker.
 - **Preview** dos parâmetros antes de rodar o job: o botão **Preview** do grupo
   Filter abre o mesmo viewer com o dataset importado (na seção original) e aplica
   o filtro configurado (tipo, cortes e ordem) em memória apenas à seção em tela,
@@ -371,6 +377,13 @@ melhor para todos os cenários; ele foi o formato mais adequado ao escopo adotad
 - No espectro em dB, original e filtrado usam a mesma referência: o pico do
   original. Isso mantém a atenuação visível. Um piso de -120 dB evita `log(0)`.
 - A resposta teórica usa o mesmo SOS do processamento e um eixo Y separado.
+- Espectro de um traço = inspeção local; espectro agregado de vários traços =
+  QC regional/de conjunto. O agregado é `mean_i |FFT(traço_i)|`, **nunca**
+  `|FFT(mean_i traço_i)|`: a média no domínio do tempo deixa traços vizinhos se
+  cancelarem por fase e subestima o conteúdo de frequência real. A média é feita
+  em magnitude linear e só então convertida para dB (mesma referência e piso do
+  espectro de um traço); a resposta teórica é uma só, não N respostas. Tudo sai
+  da seção em memória, então o custo não cresce com o tamanho do SEG-Y.
 - `processed_traces`, e não o percentual arredondado, define o ponto exato de
   retomada. O HDF5 é a autoridade do resultado físico já gravado.
 
