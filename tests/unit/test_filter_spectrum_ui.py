@@ -2,15 +2,6 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
-from test_main_window import (
-    FakeTraceReader,
-    FakeTraceWriter,
-    _build_service,
-    _dataset,
-    _wait_settled,
-)
-from test_seismic_renderers import _open
-from test_spectrum_science import make_view
 
 from giecar_seismic.application.seismic_viewer import (
     SeismicViewerService,
@@ -21,6 +12,15 @@ from giecar_seismic.domain.job import FilterType, Job
 from giecar_seismic.ui.main_window import JOBS_TABLE_HEADERS, MainWindow
 from giecar_seismic.ui.matplotlib_renderer import MatplotlibSeismicRenderer
 from giecar_seismic.ui.pyqtgraph_renderer import PyQtGraphSeismicRenderer
+from tests.unit.test_main_window import (
+    FakeTraceReader,
+    FakeTraceWriter,
+    _build_service,
+    _dataset,
+    _wait_settled,
+)
+from tests.unit.test_seismic_renderers import _open
+from tests.unit.test_spectrum_science import make_view
 
 
 @pytest.mark.parametrize(

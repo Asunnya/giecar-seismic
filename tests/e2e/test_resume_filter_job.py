@@ -3,7 +3,6 @@
 import h5py
 import numpy as np
 import pytest
-from test_end_to_end_filter_pipeline import FOOTPRINTS, compose, write_segy
 
 from giecar_seismic.application.butterworth_filter import apply_lowpass_filter
 from giecar_seismic.application.filter_jobs import (
@@ -18,6 +17,7 @@ from giecar_seismic.infrastructure.database.repositories import (
 )
 from giecar_seismic.infrastructure.segy.reader import open_dataset_reader
 from giecar_seismic.infrastructure.storage.hdf5_writer import open_hdf5_resume_writer
+from tests.e2e.test_end_to_end_filter_pipeline import FOOTPRINTS, compose, write_segy
 
 
 def setup_cancelled(tmp_path, chunk_size=2):

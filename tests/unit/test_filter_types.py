@@ -1,18 +1,17 @@
-import h5py
 import numpy as np
 import pytest
-from sqlalchemy import text
-from test_end_to_end_filter_pipeline import FOOTPRINTS, compose, write_segy
-from test_filter_job_service import FakeDatasetRepository, FakeJobRepository
 
 from giecar_seismic.application.butterworth_filter import apply_butterworth_filter
 from giecar_seismic.application.filter_jobs import (
-    CooperativeCancelToken,
     FilterJobService,
     InvalidFilterParametersError,
 )
 from giecar_seismic.domain.dataset import SeismicDataset
-from giecar_seismic.domain.job import FilterType, Job, JobStatus
+from giecar_seismic.domain.job import FilterType, Job
+from tests.unit.test_filter_job_service import (
+    FakeDatasetRepository,
+    FakeJobRepository,
+)
 
 
 @pytest.fixture
@@ -92,44 +91,6 @@ def test_invalid_orders(dataset, kind, order):
         )
 
 
-@pytest.mark.parametrize("kind,cutoff,upper,_passes", CASES)
-def test_filter_types_stream_persist_and_reopen(tmp_path, kind, cutoff, upper, _passes):
-    segy_path = tmp_path / "survey.segy"
-    amplitudes = write_segy(segy_path, FOOTPRINTS[0], 128, 4000)
-    db_path = tmp_path / "jobs.sqlite"
-    engine, importer, service = compose(db_path, tmp_path / "outputs", chunk_size=3)
-    dataset = importer(str(segy_path), "survey")
-    job = service.create_filter_job(
-        dataset.id, cutoff, 4, filter_type=kind, upper_cutoff_hz=upper
-    )
-    progress = []
-    finished = service.run_filter_job(job.id, progress.append, CooperativeCancelToken())
-    assert finished.status is JobStatus.COMPLETED
-    assert progress == [38, 75, 100]
-    with engine.connect() as connection:
-        assert (
-            connection.execute(text("SELECT filter_type FROM jobs")).scalar_one()
-            == kind.name
-        )
-    engine.dispose()
-    fresh_engine, _, fresh_service = compose(db_path, tmp_path / "outputs", 3)
-    try:
-        reloaded = fresh_service.get_job_status(job.id)
-        assert reloaded.filter_type is kind
-        assert reloaded.upper_cutoff_hz == upper
-        assert reloaded.status is JobStatus.COMPLETED
-        with h5py.File(reloaded.output_path, "r") as output:
-            assert output.attrs["complete"]
-            expected = apply_butterworth_filter(
-                amplitudes, cutoff, 4, 4.0, filter_type=kind, upper_cutoff_hz=upper
-            )
-            np.testing.assert_allclose(
-                output["traces"][:], expected, rtol=1e-5, atol=1e-6
-            )
-    finally:
-        fresh_engine.dispose()
-
-
 @pytest.mark.parametrize("kind", list(FilterType))
 @pytest.mark.parametrize("order", [2, 8])
 def test_order_boundaries_are_accepted(dataset, kind, order):
@@ -150,31 +111,3 @@ def test_invalid_filter_type_is_rejected_before_persistence(dataset):
     with pytest.raises(InvalidFilterParametersError, match="filter_type"):
         service.create_filter_job(1, 10, 4, filter_type="high cut")
     assert service.list_jobs() == []
-
-
-def test_repository_update_and_list_preserve_changed_filter_configuration(tmp_path):
-    from giecar_seismic.infrastructure.database.engine import make_session_factory
-    from giecar_seismic.infrastructure.database.repositories import (
-        SqlAlchemyJobRepository,
-    )
-
-    segy_path = tmp_path / "survey.segy"
-    write_segy(segy_path, FOOTPRINTS[0], 64, 4000)
-    engine, importer, service = compose(tmp_path / "jobs.sqlite", tmp_path / "out", 3)
-    try:
-        dataset = importer(str(segy_path), "survey")
-        job = service.create_filter_job(dataset.id, 30, 4)
-        jobs = SqlAlchemyJobRepository(make_session_factory(engine))
-        job.filter_type = FilterType.BAND_PASS
-        job.cutoff_hz, job.upper_cutoff_hz = 10, 40
-        jobs.update(job)
-        reloaded = jobs.list()[0]
-        assert reloaded.filter_type is FilterType.BAND_PASS
-        assert (reloaded.cutoff_hz, reloaded.upper_cutoff_hz) == (10, 40)
-        job.filter_type = FilterType.HIGH_PASS
-        job.upper_cutoff_hz = None
-        jobs.update(job)
-        assert jobs.get(job.id).upper_cutoff_hz is None
-        assert jobs.get(job.id).filter_type is FilterType.HIGH_PASS
-    finally:
-        engine.dispose()

@@ -7,13 +7,13 @@ import numpy as np
 import pytest
 from PyQt5 import sip
 from PyQt5.QtCore import QCoreApplication, QEvent, Qt
-from test_seismic_renderers import _open, _section
 
 from giecar_seismic.application.seismic_viewer import (
     SeismicViewerService,
     SpectrumScale,
 )
 from giecar_seismic.domain.job import FilterType
+from tests.unit.test_seismic_renderers import _open, _section
 
 
 @pytest.fixture

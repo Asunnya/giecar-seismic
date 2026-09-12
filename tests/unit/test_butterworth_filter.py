@@ -6,14 +6,14 @@ from giecar_seismic.application.butterworth_filter import apply_lowpass_filter
 def test_output_shape_matches_input_shape():
     chunk = np.zeros((4, 850), dtype=np.float32)
 
-    filtered = apply_lowpass_filter(
-        chunk, cutoff_hz=30.0, order=4, sample_rate_ms=4.0
-    )
+    filtered = apply_lowpass_filter(chunk, cutoff_hz=30.0, order=4, sample_rate_ms=4.0)
 
     assert filtered.shape == chunk.shape
 
 
-def _sine_trace(frequency_hz: float, sample_rate_ms: float, n_samples: int) -> np.ndarray:
+def _sine_trace(
+    frequency_hz: float, sample_rate_ms: float, n_samples: int
+) -> np.ndarray:
     sampling_frequency_hz = 1000 / sample_rate_ms
     t = np.arange(n_samples) / sampling_frequency_hz
     return np.sin(2 * np.pi * frequency_hz * t)

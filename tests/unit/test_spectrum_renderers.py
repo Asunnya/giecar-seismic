@@ -1,6 +1,5 @@
 import numpy as np
 import pytest
-from test_spectrum_science import make_view
 
 from giecar_seismic.application.seismic_viewer import (
     SeismicViewerService,
@@ -11,6 +10,7 @@ from giecar_seismic.domain.job import FilterType
 from giecar_seismic.ui.matplotlib_spectrum_renderer import MatplotlibSpectrumRenderer
 from giecar_seismic.ui.pyqtgraph_spectrum_renderer import PyQtGraphSpectrumRenderer
 from giecar_seismic.ui.spectrum_renderer import SpectrumVisibility
+from tests.unit.test_spectrum_science import make_view
 
 
 @pytest.mark.parametrize(

@@ -42,8 +42,12 @@ def test_read_chunk_returns_expected_traces(tiny_segy_path):
         chunk = reader.read_chunk(1, 3)
 
         assert chunk.shape == (2, N_SAMPLES)
-        np.testing.assert_array_equal(chunk[0], np.arange(N_SAMPLES, dtype=np.float32) + 1)
-        np.testing.assert_array_equal(chunk[1], np.arange(N_SAMPLES, dtype=np.float32) + 2)
+        np.testing.assert_array_equal(
+            chunk[0], np.arange(N_SAMPLES, dtype=np.float32) + 1
+        )
+        np.testing.assert_array_equal(
+            chunk[1], np.arange(N_SAMPLES, dtype=np.float32) + 2
+        )
     finally:
         reader.close()
 

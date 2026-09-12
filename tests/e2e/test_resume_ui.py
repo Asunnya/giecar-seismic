@@ -2,12 +2,12 @@ from pathlib import Path
 
 import pytest
 from PyQt5.QtCore import QThread
-from test_resume_filter_job import resumed_service, setup_cancelled
 
 from giecar_seismic.application.filter_jobs import CooperativeCancelToken
 from giecar_seismic.domain.job import JobStatus
 from giecar_seismic.ui.main_window import MainWindow
 from giecar_seismic.ui.workers import FilterJobWorker
+from tests.e2e.test_resume_filter_job import resumed_service, setup_cancelled
 
 
 @pytest.mark.parametrize(
