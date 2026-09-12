@@ -49,21 +49,21 @@ class Job:
 
     def start(self) -> None:
         self._transition("start", JobStatus.CREATED, JobStatus.RUNNING)
-        self.started_at = datetime.now()
+        self.started_at = datetime.now()  # noqa: DTZ005 -- naive local time, same policy as SeismicDataset.created_at
 
     def complete(self) -> None:
         self._transition("complete", JobStatus.RUNNING, JobStatus.COMPLETED)
         self.progress = 100.0
-        self.finished_at = datetime.now()
+        self.finished_at = datetime.now()  # noqa: DTZ005 -- naive local time, same policy as SeismicDataset.created_at
 
     def fail(self, error_message: str) -> None:
         self._transition("fail", JobStatus.RUNNING, JobStatus.FAILED)
         self.error_message = error_message
-        self.finished_at = datetime.now()
+        self.finished_at = datetime.now()  # noqa: DTZ005 -- naive local time, same policy as SeismicDataset.created_at
 
     def cancel(self) -> None:
         self._transition("cancel", JobStatus.RUNNING, JobStatus.CANCELLED)
-        self.finished_at = datetime.now()
+        self.finished_at = datetime.now()  # noqa: DTZ005 -- naive local time, same policy as SeismicDataset.created_at
 
     def advance_progress(self, progress: float) -> None:
         """Record progress reached so far (0..100) while RUNNING.
