@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "Asunnya", email = "develop-asunnya@outlook.com" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "h5py>=3.16.0",
     "matplotlib>=3.11.2",
@@ -24,6 +24,17 @@ giecar-seismic = "giecar_seismic.__main__:main"
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.uv]
+# The lock must carry installable artifacts for every environment below (PEP 508
+# markers as uv expects them): uv backtracks to a version that ships a wheel for
+# each of them instead of locking a Linux-only resolution.
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 
 [[tool.mypy.overrides]]
 module = "segyio.*"
