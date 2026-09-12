@@ -1,3 +1,4 @@
+import logging
 import threading
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
@@ -11,6 +12,18 @@ from giecar_seismic.application.butterworth_filter import (
     butterworth_sos,
 )
 from giecar_seismic.application.dataset_import import read_source_fingerprint
+from giecar_seismic.application.job_logging import (
+    CANCEL_REQUESTED,
+    JOB_CANCELLED,
+    JOB_COMPLETED,
+    JOB_CREATED,
+    JOB_FAILED,
+    RESUME_STARTED,
+    RUN_STARTED,
+    JobExecutionLogger,
+    JobLogLevel,
+    NullJobExecutionLogger,
+)
 from giecar_seismic.application.parallel_filter import filter_chunk_with_executor
 from giecar_seismic.domain.dataset import SeismicDataset
 from giecar_seismic.domain.job import FilterType, InvalidTransitionError, Job, JobStatus
@@ -218,6 +231,15 @@ MAX_FILTER_ORDER = 8
 DEFAULT_CHUNK_SIZE = 256
 
 
+_module_log = logging.getLogger(__name__)
+
+
+def _short(exc: BaseException, limit: int = 200) -> str:
+    """One-line, bounded error text for the log -- never a traceback."""
+    text = f"{type(exc).__name__}: {exc}".splitlines()[0]
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
 class FilterJobService:
     def __init__(
         self,
@@ -229,6 +251,7 @@ class FilterJobService:
         *,
         resume_writer_factory: ResumeWriterFactory | None = None,
         parallel_workers: int = 1,
+        execution_logger: JobExecutionLogger | None = None,
     ):
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
@@ -245,6 +268,7 @@ class FilterJobService:
         self._writer_factory = writer_factory
         self._chunk_size = chunk_size
         self._parallel_workers = parallel_workers
+        self._execution_logger = execution_logger or NullJobExecutionLogger()
         # Tracks the single active run_filter_job() execution per job id
         # (see _RunRegistration), so that:
         #   - cancel_job() -- which does not receive the token as an
@@ -262,6 +286,41 @@ class FilterJobService:
         # I/O such as reading/filtering/writing a chunk or finalize().
         self._cancel_tokens: dict[int, _RunRegistration] = {}
         self._cancel_tokens_lock = threading.Lock()
+
+    def _log(self, job_id: int, level: JobLogLevel, event: str, message: str) -> None:
+        # Observability only, best-effort: a log directory that cannot be
+        # written must never change a job's outcome, repeat a chunk, or
+        # touch a checkpoint. The failure is reported through the
+        # process's ordinary logging and otherwise ignored.
+        try:
+            self._execution_logger.log(job_id, level, event, message)
+        except Exception:  # noqa: BLE001 -- see comment above
+            _module_log.warning(
+                "execution log write failed for job %s (%s)",
+                job_id,
+                event,
+                exc_info=True,
+            )
+
+    def _log_cancelled(self, job: Job, trace_count: int) -> None:
+        assert job.id is not None
+        self._log(
+            job.id,
+            JobLogLevel.WARNING,
+            JOB_CANCELLED,
+            f"Processamento cancelado após {job.processed_traces} de "
+            f"{trace_count} traces.",
+        )
+
+    @staticmethod
+    def _describe_filter(job: Job) -> str:
+        if job.filter_type is FilterType.BAND_PASS:
+            return (
+                f"Band-pass, cutoffs {job.cutoff_hz:g}-{job.upper_cutoff_hz:g} Hz, "
+                f"ordem {job.order}"
+            )
+        name = "High-pass" if job.filter_type is FilterType.HIGH_PASS else "Low-pass"
+        return f"{name}, cutoff {job.cutoff_hz:g} Hz, ordem {job.order}"
 
     def create_filter_job(
         self,
@@ -316,7 +375,16 @@ class FilterJobService:
             filter_type=filter_type,
             upper_cutoff_hz=upper_cutoff_hz,
         )
-        return self._jobs.add(job)
+        job = self._jobs.add(job)
+        # Only once persisted: the id names the log file.
+        assert job.id is not None
+        self._log(
+            job.id,
+            JobLogLevel.INFO,
+            JOB_CREATED,
+            f"Job criado para o dataset {job.dataset_id} com {self._describe_filter(job)}.",
+        )
+        return job
 
     def list_jobs(
         self, dataset_id: int | None = None, status: JobStatus | None = None
@@ -390,6 +458,13 @@ class FilterJobService:
             # safe too.
             registration.token.request_cancel()
 
+        # Accepted and signalled -- logged outside the lock (it's I/O).
+        self._log(
+            job_id,
+            JobLogLevel.WARNING,
+            CANCEL_REQUESTED,
+            "Cancelamento solicitado; será atendido na próxima fronteira de chunk.",
+        )
         return job
 
     def run_filter_job(
@@ -465,6 +540,14 @@ class FilterJobService:
             else:
                 job.start()
                 self._jobs.update(job)
+                self._log(
+                    job_id,
+                    JobLogLevel.INFO,
+                    RUN_STARTED,
+                    f"Processamento iniciado: dataset {job.dataset_id}, "
+                    f"{self._describe_filter(job)}, chunk de {self._chunk_size} traces, "
+                    f"{self._parallel_workers} processo(s).",
+                )
 
             reader: TraceReader | None = None
             writer: TraceWriter | None = None
@@ -537,6 +620,13 @@ class FilterJobService:
                     job.progress = 100 * start_trace / trace_count
                     job.record_checkpoint(start_trace, trace_count)
                     self._jobs.update(job)
+                    self._log(
+                        job_id,
+                        JobLogLevel.INFO,
+                        RESUME_STARTED,
+                        f"Processamento retomado a partir do trace {start_trace} "
+                        f"de {trace_count} (retomada #{job.resume_count}).",
+                    )
                     progress_callback(round(job.progress))
                 else:
                     assert self._writer_factory is not None
@@ -563,6 +653,7 @@ class FilterJobService:
                 for start in range(start_trace, trace_count, self._chunk_size):
                     if cancel_token.is_cancelled():
                         job.cancel()
+                        self._log_cancelled(job, trace_count)
                         return job
 
                     stop = min(start + self._chunk_size, trace_count)
@@ -616,15 +707,31 @@ class FilterJobService:
 
                 if cancelled:
                     job.cancel()
+                    self._log_cancelled(job, trace_count)
                     return job
 
                 if not already_complete:
                     writer.finalize()
                 job.complete()
+                # Strictly after finalize(): the output is complete on disk.
+                self._log(
+                    job_id,
+                    JobLogLevel.INFO,
+                    JOB_COMPLETED,
+                    f"Processamento concluído: {trace_count} traces. "
+                    f"Saída: {job.output_path}",
+                )
             except Exception as exc:
                 if job.status is not JobStatus.RUNNING:
                     raise  # failed resume validation leaves CANCELLED retryable
                 job.fail(str(exc))
+                self._log(
+                    job_id,
+                    JobLogLevel.ERROR,
+                    JOB_FAILED,
+                    f"Processamento falhou após {job.processed_traces} traces: "
+                    f"{_short(exc)}",
+                )
             finally:
                 # Ownership: whoever created a resource here is
                 # responsible for releasing it, on every path. finalize()
