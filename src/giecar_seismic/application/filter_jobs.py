@@ -216,9 +216,15 @@ class _RunRegistration:
     request explicitly instead of accepting one it can no longer honor.
     """
 
-    __slots__ = ("committed", "token")
+    __slots__ = ("cancel_request_pending", "committed", "token")
 
     def __init__(self, token: CancelToken) -> None:
+        # Set by cancel_job() once a request is accepted and signalled;
+        # consumed by the worker thread, which writes CANCEL_REQUESTED to
+        # the execution log itself. Keeps file I/O off the caller's (GUI)
+        # thread while preserving "only accepted requests are logged" and
+        # the CANCEL_REQUESTED -> JOB_CANCELLED/JOB_FAILED order.
+        self.cancel_request_pending = False
         self.token = token
         self.committed = False
 
@@ -303,8 +309,25 @@ class FilterJobService:
                 exc_info=True,
             )
 
-    def _log_cancelled(self, job: Job, trace_count: int) -> None:
+    def _flush_cancel_request_log(
+        self, registration: _RunRegistration, job_id: int
+    ) -> None:
+        with self._cancel_tokens_lock:
+            pending = registration.cancel_request_pending
+            registration.cancel_request_pending = False
+        if pending:
+            self._log(
+                job_id,
+                JobLogLevel.WARNING,
+                CANCEL_REQUESTED,
+                "Cancelamento solicitado; atendido na fronteira de chunk seguinte.",
+            )
+
+    def _log_cancelled(
+        self, registration: _RunRegistration, job: Job, trace_count: int
+    ) -> None:
         assert job.id is not None
+        self._flush_cancel_request_log(registration, job.id)
         self._log(
             job.id,
             JobLogLevel.WARNING,
@@ -490,14 +513,11 @@ class FilterJobService:
             # calls in a row (or one racing a worker about to finish) is
             # safe too.
             registration.token.request_cancel()
+            # Accepted and signalled. The log line is written by the worker
+            # at its next boundary (see _flush_cancel_request_log), never
+            # here: this method runs on the caller's thread -- the GUI's.
+            registration.cancel_request_pending = True
 
-        # Accepted and signalled -- logged outside the lock (it's I/O).
-        self._log(
-            job_id,
-            JobLogLevel.WARNING,
-            CANCEL_REQUESTED,
-            "Cancelamento solicitado; será atendido na próxima fronteira de chunk.",
-        )
         return job
 
     def run_filter_job(
@@ -686,7 +706,7 @@ class FilterJobService:
                 for start in range(start_trace, trace_count, self._chunk_size):
                     if cancel_token.is_cancelled():
                         job.cancel()
-                        self._log_cancelled(job, trace_count)
+                        self._log_cancelled(registration, job, trace_count)
                         return job
 
                     stop = min(start + self._chunk_size, trace_count)
@@ -740,7 +760,7 @@ class FilterJobService:
 
                 if cancelled:
                     job.cancel()
-                    self._log_cancelled(job, trace_count)
+                    self._log_cancelled(registration, job, trace_count)
                     return job
 
                 if not already_complete:
@@ -758,6 +778,7 @@ class FilterJobService:
                 if job.status is not JobStatus.RUNNING:
                     raise  # failed resume validation leaves CANCELLED retryable
                 job.fail(str(exc))
+                self._flush_cancel_request_log(registration, job_id)
                 self._log(
                     job_id,
                     JobLogLevel.ERROR,

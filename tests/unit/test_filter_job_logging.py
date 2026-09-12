@@ -1,3 +1,5 @@
+import threading
+
 import numpy as np
 import pytest
 
@@ -310,3 +312,85 @@ def test_run_started_message_carries_the_audit_parameters(dataset):
     assert "chunk" in started.lower() and "3" in started
     completed = logger.records[2][3]
     assert f"{dataset.n_traces}" in completed and "/fake/output.h5" in completed
+
+
+# --- M1: no log I/O on the caller's (GUI) thread for cancel ------------------
+
+
+class ThreadRecordingLogger(RecordingJobExecutionLogger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.threads: dict[str, str] = {}
+
+    def log(self, job_id, level, event, message):
+        super().log(job_id, level, event, message)
+        self.threads[event] = threading.current_thread().name
+
+
+def test_cancel_requested_is_written_by_the_worker_not_the_caller(dataset):
+    logger = ThreadRecordingLogger()
+    entered, release = threading.Event(), threading.Event()
+    reader = FakeTraceReader(np.zeros((dataset.n_traces, dataset.n_samples)))
+    original_read = reader.read_chunk
+
+    def blocking_read(start, stop):
+        entered.set()
+        assert release.wait(timeout=5), "test deadlocked"
+        return original_read(start, stop)
+
+    reader.read_chunk = blocking_read
+    service = build_service(dataset, reader, FakeTraceWriter(), logger, chunk_size=2)
+    job = service.create_filter_job(dataset.id, 30, 4)
+    token = CooperativeCancelToken()
+    worker = threading.Thread(
+        target=service.run_filter_job,
+        args=(job.id, lambda _: None, token),
+        name="filter-worker",
+    )
+    worker.start()
+    assert entered.wait(timeout=5)
+
+    service.cancel_job(job.id)  # accepted on this (the "GUI") thread
+    assert "CANCEL_REQUESTED" not in logger.events  # nothing written here
+
+    release.set()
+    worker.join(timeout=5)
+    assert logger.events == [
+        "JOB_CREATED",
+        "RUN_STARTED",
+        "CANCEL_REQUESTED",
+        "JOB_CANCELLED",
+    ]
+    assert logger.threads["CANCEL_REQUESTED"] == "filter-worker"
+    assert logger.threads["JOB_CANCELLED"] == "filter-worker"
+    assert logger.threads["JOB_CREATED"] == threading.current_thread().name
+
+
+def test_accepted_cancel_followed_by_a_failure_still_records_the_request(dataset):
+    logger = RecordingJobExecutionLogger()
+    writer = WriteChunkRaisingTraceWriter()
+    service = build_service(
+        dataset,
+        FakeTraceReader(np.zeros((dataset.n_traces, dataset.n_samples))),
+        writer,
+        logger,
+        chunk_size=2,
+    )
+    job = service.create_filter_job(dataset.id, 30, 4)
+    token = CooperativeCancelToken()
+    original_write = writer.write_chunk
+
+    def cancel_then_fail(start, chunk):
+        service.cancel_job(job.id)  # accepted mid-chunk...
+        original_write(start, chunk)  # ...then the chunk write raises
+
+    writer.write_chunk = cancel_then_fail
+    result = service.run_filter_job(job.id, lambda _: None, token)
+
+    assert result.status is JobStatus.FAILED
+    assert logger.events == [
+        "JOB_CREATED",
+        "RUN_STARTED",
+        "CANCEL_REQUESTED",
+        "JOB_FAILED",
+    ]
