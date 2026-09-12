@@ -84,33 +84,37 @@ CUTOFF_EPSILON_HZ = 0.01
 
 
 class MainWindow(QMainWindow):
+    """Dataset -> Filter -> Processing -> Jobs history, plus the seismic
+    viewer and the per-job execution log.
+
+    Every dependency arrives by construction and is composed in
+    `__main__` (SQLite repositories, SEG-Y reader, HDF5 writer and resume
+    writer, optional process pool, execution logger, viewer, log reader);
+    this window never imports infrastructure. `dataset_importer` reads
+    SEG-Y headers and persists the dataset, so what reaches
+    set_dataset() already has an id. `service` is the FilterJobService
+    behind Run/Cancel/Resume and the history; `open_viewer` opens the
+    2D viewer for a COMPLETED job; `read_job_log` returns a job's log
+    text. Any dependency left as None disables its control instead of
+    faking it.
+
+    Background work never runs on the GUI thread. Four independent
+    QThread/worker pairs are tracked as instance attributes for as long
+    as they live -- filter job (`_thread`/`_worker`), SEG-Y import
+    (`_import_thread`/`_import_worker`), history query
+    (`_history_thread`/`_history_worker`) and log read
+    (`_log_thread`/`_log_worker`) -- and are never conflated: they are
+    distinct operations that can, in principle, be in flight
+    independently. Each pair follows the same lifecycle (moveToThread,
+    terminal signals -> thread.quit + worker.deleteLater,
+    thread.finished -> drop the references); closeEvent refuses to close
+    while any of them is alive and only ever requests cooperative
+    cancellation of the filter job.
+    """
+
     # Emitted on the GUI thread once a history query has finished -- table
     # rebuilt from the list_jobs() result and its QThread already gone.
     history_refreshed = pyqtSignal()
-
-    """First vertical slice of the desktop UI: Dataset -> Filter ->
-    Processing -> Jobs, wired to run a single filter job on a QThread.
-
-    Dependencies are accepted by construction rather than composed here.
-    `dataset_importer` is the full import (read SEG-Y metadata + persist
-    to SQLite -- application.dataset_import.ImportDatasetUseCase in
-    production), so the dataset that arrives via set_dataset() already
-    carries its persistent id; this window never touches a repository or
-    SQLAlchemy itself. `service` is still not composed by the entrypoint
-    (the SEG-Y/HDF5 reader/writer factories it needs for a real run
-    aren't wired yet), so "Run Filter" stays disabled -- an explicit,
-    visible incomplete composition rather than a fake demo. Either
-    dependency left as None disables the corresponding control.
-
-    Selecting a SEG-Y file records its path and starts a background
-    import (see SegyImportWorker) that reads trace headers and produces a
-    SeismicDataset, which then flows into set_dataset(). That import
-    thread/worker is tracked separately from the filter job's -- they are
-    two distinct, independently-lived worker pairs (`_import_thread`/
-    `_import_worker` vs `_thread`/`_worker`), never conflated, since a
-    dataset import and a filter run are different operations that can, in
-    principle, be in flight independently.
-    """
 
     def __init__(
         self,
