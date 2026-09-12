@@ -82,29 +82,46 @@ def open_dataset_reader(dataset: SeismicDataset) -> SegyTraceReader:
     return SegyTraceReader(dataset.source_path)
 
 
+def _iter_inline_crossline_batches(
+    segy, batch_size: int
+) -> Iterator[tuple[int, np.ndarray, np.ndarray]]:
+    """Yield bounded header arrays from an already-open physical trace stream.
+
+    This is the single slicing primitive shared by metadata import and geometry
+    indexing. It retains no prior batch and never accesses trace amplitudes.
+    """
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    total = segy.tracecount
+    inlines = segy.attributes(segyio.TraceField.INLINE_3D)
+    crosslines = segy.attributes(segyio.TraceField.CROSSLINE_3D)
+    for start in range(0, total, batch_size):
+        stop = min(start + batch_size, total)
+        yield (
+            start,
+            np.asarray(inlines[start:stop]),
+            np.asarray(crosslines[start:stop]),
+        )
+
+
 def iter_trace_header_batches(
     source_path: str, batch_size: int
 ) -> Iterator[list[TraceGeometry]]:
     """TraceHeaderBatchReader for BuildGeometryIndexUseCase.
 
     Reads INLINE_3D/CROSSLINE_3D for `batch_size` traces at a time via
-    segyio attribute slices -- each batch is a small array, and nothing
-    accumulates across batches. (Unlike import_segy_dataset, which still
-    pulls the full header columns once to count distinct lines.)
+    segyio attribute slices. Each batch is a small array, and nothing
+    accumulates across batches.
     """
     with segyio.open(source_path, mode="r", ignore_geometry=True) as segy:
-        total = segy.tracecount
-        inlines = segy.attributes(segyio.TraceField.INLINE_3D)
-        crosslines = segy.attributes(segyio.TraceField.CROSSLINE_3D)
-        for start in range(0, total, batch_size):
-            stop = min(start + batch_size, total)
-            batch_inlines = np.asarray(inlines[start:stop])
-            batch_crosslines = np.asarray(crosslines[start:stop])
+        for start, batch_inlines, batch_crosslines in _iter_inline_crossline_batches(
+            segy, batch_size
+        ):
             yield [
                 TraceGeometry(
                     trace_index=start + offset,
                     inline=int(batch_inlines[offset]),
                     crossline=int(batch_crosslines[offset]),
                 )
-                for offset in range(stop - start)
+                for offset in range(len(batch_inlines))
             ]

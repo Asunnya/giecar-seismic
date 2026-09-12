@@ -15,6 +15,23 @@ uv run ruff check .
 uv run mypy src/giecar_seismic
 ```
 
+## Streaming and memory
+
+The application has two bounded streaming paths:
+
+- **Import:** SEG-Y trace headers are read in batches of 4096 to derive metadata.
+  Each batch updates sets of distinct inline and crossline identifiers and is then
+  discarded. Import uses `segyio.open(..., ignore_geometry=True)`, takes the
+  physical trace count from `segy.tracecount`, and never reads trace amplitudes.
+- **Processing:** SEG-Y amplitudes are read in configurable bounded chunks,
+  filtered with Butterworth, and written incrementally to HDF5.
+
+Import working memory is
+`O(batch_size + unique_inlines + unique_crosslines)`: temporary header arrays are
+bounded by the batch size, while the exact distinct counts require retaining only
+the geometric identifiers seen. Filtering working memory is
+`O(chunk_size * n_samples)`. Neither path materializes the complete seismic volume.
+
 ## Butterworth filters
 
 The original challenge's **Low-pass remains the default**. Existing calls to

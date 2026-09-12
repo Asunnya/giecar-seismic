@@ -1,38 +1,39 @@
 from pathlib import Path
 
-import numpy as np
 import segyio
 
 from giecar_seismic.domain.dataset import SeismicDataset
+from giecar_seismic.infrastructure.segy.reader import _iter_inline_crossline_batches
+
+DEFAULT_IMPORT_HEADER_BATCH_SIZE = 4096
 
 
 def import_segy_dataset(source_path: str | Path, name: str) -> SeismicDataset:
     """Builds a SeismicDataset by reading trace headers only.
 
-    Never touches trace amplitudes: n_inlines/n_crosslines come from the
-    per-trace INLINE_3D/CROSSLINE_3D header attributes, which is O(n_traces)
-    in header memory but independent of the sample volume. See the "scope
-    boundary" note in notebooks/01_inspect_segy.ipynb -- this is the same
-    trade-off, deliberately kept out of the streaming trace-reading path.
+    Never touches trace amplitudes. INLINE_3D/CROSSLINE_3D are read through
+    bounded temporary arrays, while sets retain only distinct geometric
+    identifiers. Working memory is therefore O(batch_size + unique inlines +
+    unique crosslines), with no per-trace collection retained across batches.
     """
     with segyio.open(source_path, mode="r", ignore_geometry=True) as segy:
         n_samples = len(segy.samples)
         n_traces = segy.tracecount
         sample_rate_ms = float(segyio.tools.dt(segy)) / 1000
 
-        inline_values = np.asarray(segy.attributes(segyio.TraceField.INLINE_3D)[:])
-        crossline_values = np.asarray(
-            segy.attributes(segyio.TraceField.CROSSLINE_3D)[:]
-        )
-
-    n_inlines = len(np.unique(inline_values))
-    n_crosslines = len(np.unique(crossline_values))
+        unique_inlines: set[int] = set()
+        unique_crosslines: set[int] = set()
+        for _, batch_inlines, batch_crosslines in _iter_inline_crossline_batches(
+            segy, DEFAULT_IMPORT_HEADER_BATCH_SIZE
+        ):
+            unique_inlines.update(int(value) for value in batch_inlines)
+            unique_crosslines.update(int(value) for value in batch_crosslines)
 
     return SeismicDataset(
         name=name,
         source_path=str(source_path),
-        n_inlines=n_inlines,
-        n_crosslines=n_crosslines,
+        n_inlines=len(unique_inlines),
+        n_crosslines=len(unique_crosslines),
         n_traces=n_traces,
         n_samples=n_samples,
         sample_rate_ms=sample_rate_ms,
