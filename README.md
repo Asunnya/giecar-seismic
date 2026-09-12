@@ -273,6 +273,22 @@ ou filtros mais caros podem mudar essa relação; por isso o padrão permanece `
 Como NumPy e SciPy também podem usar bibliotecas nativas com paralelismo interno,
 aumentar o número de processos pode ainda causar disputa pelos mesmos núcleos.
 
+### Benchmark de memória
+
+A aplicação usa **streaming**: lê 256 traços, aplica o filtro e persiste o chunk
+antes de seguir. O [notebook de benchmark](notebooks/02_memory_benchmark.ipynb)
+compara esse pipeline com uma referência ingênua que mantém todo o prefixo e seu
+resultado na memória. Cada medição roda em um processo isolado e usa o pico RSS
+observado pelo Linux.
+
+No SEG-Y real de 288.694 traços e 850 amostras, as medianas para 4.096, 16.384 e
+65.536 traços foram, respectivamente, `197,6`, `445,2` e `1.435,2 MB` na abordagem
+ingênua. O streaming ficou em `165,7 MB` nos três casos, igual ao baseline mediano
+das bibliotecas nesse ambiente. Isso indica que seus chunks não elevaram o pico já
+existente; não significa ausência de memória de trabalho. O caso ingênuo foi
+limitado a subconjuntos seguros, pois carregar o survey completo apenas para
+provocar consumo seria desnecessário e arriscado.
+
 ### Por que HDF5?
 
 HDF5 foi escolhido porque o projeto é uma aplicação desktop que produz arquivos
