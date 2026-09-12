@@ -16,6 +16,12 @@ from giecar_seismic.domain.job import Job, JobStatus
 # functions. The worker deliberately doesn't know which.
 DatasetImporter = Callable[[str, str], SeismicDataset]
 
+# Returns the whole text of a job's execution log; raises (e.g.
+# FileNotFoundError) when there is none. Production: a closure over
+# infrastructure.logging.read_job_log and the logs directory -- the UI
+# never builds log paths itself.
+JobLogReader = Callable[[int], str]
+
 
 class FilterJobWorker(QObject):
     """Runs FilterJobService.run_filter_job() off the GUI thread.
@@ -165,3 +171,24 @@ class JobHistoryWorker(QObject):
             return
         self.trace_counts_ready.emit({i: d.n_traces for i, d in found.items()})
         self.succeeded.emit(jobs, labels)
+
+
+class JobLogWorker(QObject):
+    """Reads one job's execution log off the GUI thread and emits its text
+    (or the failure message). Never touches a QWidget."""
+
+    loaded = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, read_job_log: JobLogReader, job_id: int) -> None:
+        super().__init__()
+        self._read_job_log = read_job_log
+        self._job_id = job_id
+
+    def run(self) -> None:
+        try:
+            text = self._read_job_log(self._job_id)
+        except Exception as exc:  # noqa: BLE001 -- any failure must reach the GUI via a signal
+            self.failed.emit(str(exc))
+            return
+        self.loaded.emit(text)

@@ -18,6 +18,10 @@ from giecar_seismic.infrastructure.database.repositories import (
     SqlAlchemyGeometryRepository,
     SqlAlchemyJobRepository,
 )
+from giecar_seismic.infrastructure.logging.job_execution_logger import (
+    FileJobExecutionLogger,
+    read_job_log,
+)
 from giecar_seismic.infrastructure.segy.dataset_importer import import_segy_dataset
 from giecar_seismic.infrastructure.segy.reader import (
     iter_trace_header_batches,
@@ -36,6 +40,7 @@ from giecar_seismic.ui.seismic_viewer import SeismicViewer
 APP_DIR = Path.home() / ".giecar-seismic"
 DEFAULT_DATABASE_PATH = APP_DIR / "giecar.sqlite"
 DEFAULT_OUTPUTS_DIR = APP_DIR / "outputs"
+DEFAULT_LOGS_DIR = APP_DIR / "logs"  # one append-only job_<id>.log per job
 
 
 def parse_filter_process_count(
@@ -73,6 +78,7 @@ def main() -> int:
         os.environ.get("GIECAR_FILTER_PROCESSES")
     )
     APP_DIR.mkdir(parents=True, exist_ok=True)
+    DEFAULT_LOGS_DIR.mkdir(parents=True, exist_ok=True)
     engine = create_sqlite_engine(DEFAULT_DATABASE_PATH)
     # create_all is not a migration: it only adds missing tables. A
     # database created with an older schema must be recreated explicitly.
@@ -89,6 +95,7 @@ def main() -> int:
         writer_factory=make_hdf5_writer_factory(DEFAULT_OUTPUTS_DIR),
         resume_writer_factory=open_hdf5_resume_writer,
         parallel_workers=parallel_workers,
+        execution_logger=FileJobExecutionLogger(DEFAULT_LOGS_DIR),
     )
 
     # Viewer: geometry index (built lazily, in bounded batches, on first
@@ -111,7 +118,10 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     window = MainWindow(
-        service=service, dataset_importer=import_dataset, open_viewer=open_viewer
+        service=service,
+        dataset_importer=import_dataset,
+        open_viewer=open_viewer,
+        read_job_log=lambda job_id: read_job_log(DEFAULT_LOGS_DIR, job_id),
     )
     window.show()
     return app.exec_()

@@ -4,9 +4,10 @@ from math import ceil
 from pathlib import Path
 
 from PyQt5.QtCore import QThread, QTimer, QUrl, pyqtSignal
-from PyQt5.QtGui import QCloseEvent, QDesktopServices
+from PyQt5.QtGui import QCloseEvent, QDesktopServices, QFont
 from PyQt5.QtWidgets import (
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -15,6 +16,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QSpinBox,
@@ -36,6 +38,8 @@ from giecar_seismic.ui.workers import (
     DatasetImporter,
     FilterJobWorker,
     JobHistoryWorker,
+    JobLogReader,
+    JobLogWorker,
     SegyImportWorker,
     dataset_labels,
 )
@@ -114,12 +118,19 @@ class MainWindow(QMainWindow):
         dataset_importer: DatasetImporter | None = None,
         open_viewer: ViewerOpener | None = None,
         parent: QWidget | None = None,
+        *,
+        read_job_log: JobLogReader | None = None,
     ) -> None:
         super().__init__(parent)
         self._service = service
         self._dataset_importer = dataset_importer
         self._open_viewer = open_viewer
+        self._read_job_log = read_job_log
         self._viewer: QWidget | None = None
+        self._log_dialog: JobLogDialog | None = None
+        # Third independent worker pair: reading a job's execution log.
+        self._log_thread: QThread | None = None
+        self._log_worker: JobLogWorker | None = None
         self._dataset: SeismicDataset | None = None
         self._current_job_id: int | None = None
 
@@ -313,6 +324,13 @@ class MainWindow(QMainWindow):
         self._view_output_button.setEnabled(False)
         self._view_output_button.clicked.connect(self._on_view_output_clicked)
         layout.addWidget(self._view_output_button)
+
+        # Per-job execution log (append-only file kept by the service's
+        # logger); read by JobLogWorker, shown read-only.
+        self._view_log_button = QPushButton("View log", group)
+        self._view_log_button.setEnabled(False)
+        self._view_log_button.clicked.connect(self._on_view_log_clicked)
+        layout.addWidget(self._view_log_button)
 
         return group
 
@@ -643,6 +661,7 @@ class MainWindow(QMainWindow):
             self._thread is None
             and self._import_thread is None
             and self._history_thread is None
+            and self._log_thread is None
         ):
             event.accept()
             return
@@ -831,6 +850,13 @@ class MainWindow(QMainWindow):
         self._view_output_button.setEnabled(
             self._selected_viewable_job_id() is not None
         )
+        job = self._selected_job()
+        self._view_log_button.setEnabled(
+            self._read_job_log is not None
+            and job is not None
+            and job.id is not None
+            and self._log_thread is None
+        )
 
     def _selected_viewable_job_id(self) -> int | None:
         # Only COMPLETED jobs (a finalized HDF5) are viewable -- including
@@ -850,6 +876,53 @@ class MainWindow(QMainWindow):
         self._viewer = self._open_viewer(job_id, self)
         self._viewer.show()
 
+    # -- View log: QThread -> JobLogWorker -> read-only dialog ---------------
+
+    def _on_view_log_clicked(self) -> None:
+        job = self._selected_job()
+        if (
+            self._read_job_log is None
+            or job is None
+            or job.id is None
+            or self._log_thread is not None
+        ):
+            return
+        thread = QThread(self)
+        worker = JobLogWorker(self._read_job_log, job.id)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.loaded.connect(
+            lambda text, job_id=job.id: self._show_job_log(job_id, text)
+        )
+        worker.failed.connect(
+            lambda message, job_id=job.id: self._show_job_log(job_id, message)
+        )
+        worker.loaded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.loaded.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_log_thread_finished)
+        self._log_thread = thread
+        self._log_worker = worker
+        self._refresh_output_buttons()
+        thread.start()
+
+    def _show_job_log(self, job_id: int, text: str) -> None:
+        # Content or the failure message (e.g. "No execution log exists for
+        # job 7") -- either way the user gets a readable answer, never a
+        # blocked window.
+        if self._log_dialog is None:
+            self._log_dialog = JobLogDialog(self)
+        self._log_dialog.show_log(job_id, text)
+        self._log_dialog.show()
+        self._log_dialog.raise_()
+
+    def _on_log_thread_finished(self) -> None:
+        self._log_thread = None
+        self._log_worker = None
+        self._refresh_output_buttons()
+
     def _on_open_output_clicked(self) -> None:
         path = self._selected_output_path()
         if path is not None:
@@ -859,3 +932,23 @@ class MainWindow(QMainWindow):
         # Opens the containing folder with the platform's file manager;
         # extracted so tests can observe the call without launching one.
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).parent)))
+
+
+class JobLogDialog(QDialog):
+    """Read-only, monospace view of one job's execution log."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.resize(820, 420)
+        layout = QVBoxLayout(self)
+        self._text = QPlainTextEdit(self)
+        self._text.setReadOnly(True)
+        self._text.setLineWrapMode(QPlainTextEdit.NoWrap)
+        font = QFont("Monospace")
+        font.setStyleHint(QFont.TypeWriter)
+        self._text.setFont(font)
+        layout.addWidget(self._text)
+
+    def show_log(self, job_id: int, text: str) -> None:
+        self.setWindowTitle(f"Execution log -- job {job_id}")
+        self._text.setPlainText(text)
