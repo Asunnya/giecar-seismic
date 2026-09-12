@@ -56,6 +56,11 @@ def _job_to_domain(model: JobModel) -> Job:
         order=model.order,
         status=JobStatus[model.status],
         error_message=model.error_message,
+        progress=model.progress,
+        output_path=model.output_path,
+        created_at=model.created_at,
+        started_at=model.started_at,
+        finished_at=model.finished_at,
     )
 
 
@@ -67,6 +72,11 @@ def _job_to_model(job: Job) -> JobModel:
         order=job.order,
         status=job.status.name,
         error_message=job.error_message,
+        progress=job.progress,
+        output_path=job.output_path,
+        created_at=job.created_at,
+        started_at=job.started_at,
+        finished_at=job.finished_at,
     )
 
 
@@ -115,6 +125,10 @@ class SqlAlchemyJobRepository:
             model.order = job.order
             model.status = job.status.name
             model.error_message = job.error_message
+            model.progress = job.progress
+            model.output_path = job.output_path
+            model.started_at = job.started_at
+            model.finished_at = job.finished_at
 
     def list(
         self, dataset_id: int | None = None, status: JobStatus | None = None

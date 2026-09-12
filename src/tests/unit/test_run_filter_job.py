@@ -37,6 +37,7 @@ class FakeJobRepository:
         self._jobs: dict[int, Job] = {}
         self._next_id = 1
         self.update_calls: list[tuple[int, JobStatus, str | None]] = []
+        self.progress_calls: list[tuple[int, JobStatus, str | None, float]] = []
 
     def add(self, job: Job) -> Job:
         job.id = self._next_id
@@ -51,6 +52,9 @@ class FakeJobRepository:
         assert job.id is not None
         self._jobs[job.id] = job
         self.update_calls.append((job.id, job.status, job.error_message))
+        self.progress_calls.append(
+            (job.id, job.status, job.error_message, job.progress)
+        )
 
     def list(self, dataset_id=None, status=None):
         return list(self._jobs.values())
@@ -1164,3 +1168,57 @@ def test_cancel_job_accept_and_signal_are_atomic_with_the_point_of_no_return(dat
     assert result.status is JobStatus.CANCELLED
     assert writer.finalized is False
     assert (job.id, JobStatus.CANCELLED, None) in jobs.update_calls
+
+
+# --- Progress is persisted per chunk from the reader's physical count -----
+
+
+def test_run_filter_job_persists_incremental_progress_from_physical_trace_count(
+    dataset,
+):
+    # 10 physical traces / chunk_size 4 -> chunk boundaries at 4, 8, 10.
+    # The dataset's grid says 401 x 720 = 288720 -- the progress must come
+    # from reader.trace_count, never from the grid.
+    traces = np.zeros((10, dataset.n_samples), dtype=np.float32)
+    reader = FakeTraceReader(traces)
+    writer = FakeTraceWriter()
+    jobs = FakeJobRepository()
+    service = _build_service(dataset, reader, writer, chunk_size=4, jobs=jobs)
+    job = service.create_filter_job(dataset_id=dataset.id, cutoff_hz=30.0, order=4)
+
+    service.run_filter_job(
+        job.id, progress_callback=lambda _pct: None, cancel_token=FakeCancelToken()
+    )
+
+    persisted_progress = [progress for (_, status, _, progress) in jobs.progress_calls]
+    assert persisted_progress[-1] == 100
+    assert persisted_progress == sorted(persisted_progress)
+    running_progress = [
+        progress
+        for (_, status, _, progress) in jobs.progress_calls
+        if status is JobStatus.RUNNING
+    ]
+    assert running_progress == [0, 40.0, 80.0, 100.0]
+    assert service.get_job_status(job.id).progress == 100
+
+
+def test_run_filter_job_cancellation_keeps_the_last_progress_reached(dataset):
+    traces = np.zeros((10, dataset.n_samples), dtype=np.float32)
+    reader = FakeTraceReader(traces)
+    writer = FakeTraceWriter()
+    jobs = FakeJobRepository()
+    service = _build_service(dataset, reader, writer, chunk_size=4, jobs=jobs)
+    job = service.create_filter_job(dataset_id=dataset.id, cutoff_hz=30.0, order=4)
+
+    # cancelled before chunk 2: exactly one chunk (4/10) was processed.
+    service.run_filter_job(
+        job.id,
+        progress_callback=lambda _pct: None,
+        cancel_token=FakeCancelToken(cancel_after=1),
+    )
+
+    cancelled = service.get_job_status(job.id)
+    assert cancelled.status is JobStatus.CANCELLED
+    assert cancelled.progress == 40.0
+    assert cancelled.finished_at is not None
+    assert (job.id, JobStatus.CANCELLED, None, 40.0) in jobs.progress_calls

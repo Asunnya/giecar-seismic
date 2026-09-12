@@ -36,9 +36,8 @@ class JobModel(Base):
     `status` is stored as the JobStatus member *name* (e.g. "RUNNING"),
     never its auto() integer value -- names are stable across enum
     reorderings, readable in the database, and reconstructed with
-    JobStatus[name]. Only fields the domain Job actually has today are
-    persisted; progress/output path/timestamps are not part of the
-    domain entity yet.
+    JobStatus[name]. Persists every field the domain Job has: status,
+    progress, output_path and the created/started/finished timestamps.
     """
 
     __tablename__ = "jobs"
@@ -51,3 +50,8 @@ class JobModel(Base):
     order: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False)
     error_message: Mapped[str | None] = mapped_column(String, nullable=True)
+    progress: Mapped[float] = mapped_column(Float, nullable=False)
+    output_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

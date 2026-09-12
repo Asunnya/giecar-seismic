@@ -350,3 +350,75 @@ def test_import_use_case_persists_a_real_segy_and_survives_reopening(db_path, tm
     assert fetched.n_traces != fetched.n_inlines * fetched.n_crosslines
     assert fetched.n_samples == 5
     assert fetched.sample_rate_ms == 4.0
+
+
+# --- Job progress / output_path / timestamps round-trip -------------------
+
+
+def test_job_round_trip_preserves_progress_output_and_timestamps(datasets, jobs):
+    dataset_id = _persisted_dataset_id(datasets)
+    job = jobs.add(Job(dataset_id=dataset_id, cutoff_hz=30.0, order=4))
+    assert job.id is not None
+    fetched_created = jobs.get(job.id)
+    assert fetched_created is not None
+    assert fetched_created.progress == 0
+    assert fetched_created.output_path is None
+    assert fetched_created.created_at == job.created_at
+    assert fetched_created.started_at is None
+    assert fetched_created.finished_at is None
+
+    job.start()
+    job.advance_progress(37.5)
+    job.output_path = "/out/job-1.h5"
+    jobs.update(job)
+
+    fetched_running = jobs.get(job.id)
+    assert fetched_running is not None
+    assert fetched_running.status is JobStatus.RUNNING
+    assert fetched_running.progress == 37.5
+    assert fetched_running.output_path == "/out/job-1.h5"
+    assert fetched_running.started_at == job.started_at
+    assert fetched_running.finished_at is None
+
+    job.complete()
+    jobs.update(job)
+
+    fetched_done = jobs.get(job.id)
+    assert fetched_done is not None
+    assert fetched_done.status is JobStatus.COMPLETED
+    assert fetched_done.progress == 100
+    assert fetched_done.finished_at == job.finished_at
+    assert fetched_done.started_at is not None
+    assert fetched_done.finished_at is not None
+    assert (
+        fetched_done.created_at <= fetched_done.started_at <= fetched_done.finished_at
+    )
+
+
+def test_job_progress_and_timestamps_survive_reopening_the_database(db_path):
+    engine = create_sqlite_engine(db_path)
+    create_schema(engine)
+    factory = make_session_factory(engine)
+    dataset = SqlAlchemyDatasetRepository(factory).add(_dataset())
+    assert dataset.id is not None
+    job = SqlAlchemyJobRepository(factory).add(
+        Job(dataset_id=dataset.id, cutoff_hz=30.0, order=4)
+    )
+    assert job.id is not None
+    job.start()
+    job.advance_progress(60)
+    job.output_path = "/out/partial.h5"
+    job.cancel()
+    SqlAlchemyJobRepository(factory).update(job)
+    engine.dispose()
+
+    fresh = SqlAlchemyJobRepository(make_session_factory(create_sqlite_engine(db_path)))
+    fetched = fresh.get(job.id)
+
+    assert fetched is not None
+    assert fetched.status is JobStatus.CANCELLED
+    assert fetched.progress == 60
+    assert fetched.output_path == "/out/partial.h5"
+    assert fetched.created_at == job.created_at
+    assert fetched.started_at == job.started_at
+    assert fetched.finished_at == job.finished_at

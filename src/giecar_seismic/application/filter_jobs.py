@@ -356,6 +356,11 @@ class FilterJobService:
                         chunk, job.cutoff_hz, job.order, dataset.sample_rate_ms
                     )
                     writer.write_chunk(start, filtered)
+                    # Progress is processed / *physical* trace_count (from
+                    # the reader), never n_inlines * n_crosslines. One
+                    # repository write per chunk, not per trace.
+                    job.advance_progress(100 * stop / trace_count)
+                    self._jobs.update(job)
                     progress_callback(round(100 * stop / trace_count))
 
                 # Point of no return. The per-iteration check above only
