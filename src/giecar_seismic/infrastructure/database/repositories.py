@@ -1,7 +1,7 @@
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from giecar_seismic.domain.dataset import SeismicDataset
+from giecar_seismic.domain.dataset import SeismicDataset, SourceFingerprint
 from giecar_seismic.domain.geometry import TraceGeometry
 from giecar_seismic.domain.job import Job, JobStatus
 from giecar_seismic.infrastructure.database.models import (
@@ -34,6 +34,11 @@ def _dataset_to_domain(model: DatasetModel) -> SeismicDataset:
         n_samples=model.n_samples,
         sample_rate_ms=model.sample_rate_ms,
         created_at=model.created_at,
+        source_fingerprint=(
+            SourceFingerprint(model.source_size_bytes, model.source_mtime_ns)
+            if model.source_size_bytes is not None and model.source_mtime_ns is not None
+            else None
+        ),
     )
 
 
@@ -50,6 +55,16 @@ def _dataset_to_model(dataset: SeismicDataset) -> DatasetModel:
         n_samples=dataset.n_samples,
         sample_rate_ms=dataset.sample_rate_ms,
         created_at=dataset.created_at,
+        source_size_bytes=(
+            dataset.source_fingerprint.size_bytes
+            if dataset.source_fingerprint is not None
+            else None
+        ),
+        source_mtime_ns=(
+            dataset.source_fingerprint.mtime_ns
+            if dataset.source_fingerprint is not None
+            else None
+        ),
     )
 
 
@@ -99,6 +114,16 @@ class SqlAlchemyDatasetRepository:
     def get(self, dataset_id: int) -> SeismicDataset | None:
         with self._session_factory() as session:
             model = session.get(DatasetModel, dataset_id)
+            return _dataset_to_domain(model) if model is not None else None
+
+    def find_by_source_path(self, source_path: str) -> SeismicDataset | None:
+        with self._session_factory() as session:
+            model = session.scalars(
+                select(DatasetModel)
+                .where(DatasetModel.source_path == source_path)
+                .order_by(DatasetModel.id)
+                .limit(1)
+            ).first()
             return _dataset_to_domain(model) if model is not None else None
 
 

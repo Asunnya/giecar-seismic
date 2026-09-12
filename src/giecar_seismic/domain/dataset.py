@@ -2,6 +2,20 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 
+@dataclass(frozen=True)
+class SourceFingerprint:
+    """What the source file looked like when its metadata was read.
+
+    Size and modification time are enough to tell "same file, untouched"
+    from "same path, different content" without hashing a multi-GB SEG-Y.
+    A dataset whose fingerprint no longer matches the file on disk must
+    not be reused: its n_traces/n_samples may be stale.
+    """
+
+    size_bytes: int
+    mtime_ns: int
+
+
 @dataclass
 class SeismicDataset:
     name: str
@@ -19,6 +33,8 @@ class SeismicDataset:
     sample_rate_ms: float
     created_at: datetime = field(default_factory=datetime.now)
     id: int | None = None
+    # None = unknown (never trusted as "unchanged").
+    source_fingerprint: SourceFingerprint | None = None
 
     @property
     def nyquist_hz(self) -> float:

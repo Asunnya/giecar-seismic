@@ -1,10 +1,11 @@
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from giecar_seismic.domain.dataset import SeismicDataset
+from giecar_seismic.domain.dataset import SeismicDataset, SourceFingerprint
 from giecar_seismic.domain.job import Job, JobStatus
 from giecar_seismic.infrastructure.database.engine import (
     create_schema,
@@ -117,6 +118,37 @@ def test_dataset_survives_reopening_the_repository_from_the_same_file(
 
     assert fetched is not None
     assert fetched.name == "survey"
+
+
+def test_find_by_source_path_returns_the_persisted_dataset_or_none(datasets):
+    added = datasets.add(_dataset("survey"))
+    datasets.add(_dataset("other"))
+
+    assert datasets.find_by_source_path("/data/survey.segy") == added
+    assert datasets.find_by_source_path("/data/missing.segy") is None
+
+
+def test_source_fingerprint_round_trips_including_none(datasets):
+    with_fp = replace(
+        _dataset("survey"),
+        source_fingerprint=SourceFingerprint(
+            size_bytes=1_042_996_040, mtime_ns=1_757_600_000_123_456_789
+        ),
+    )
+    without = _dataset("other")
+
+    assert (
+        datasets.get(datasets.add(with_fp).id).source_fingerprint
+        == with_fp.source_fingerprint
+    )
+    assert datasets.get(datasets.add(without).id).source_fingerprint is None
+
+
+def test_find_by_source_path_is_exact_not_a_prefix_match(datasets):
+    datasets.add(_dataset("survey"))
+
+    assert datasets.find_by_source_path("/data/survey.segy.bak") is None
+    assert datasets.find_by_source_path("/data/surv") is None
 
 
 # --- JobRepository --------------------------------------------------------

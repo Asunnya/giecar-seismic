@@ -36,6 +36,9 @@ class DatasetModel(Base):
     n_samples: Mapped[int] = mapped_column(Integer, nullable=False)
     sample_rate_ms: Mapped[float] = mapped_column(Float, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # SourceFingerprint, flattened; both NULL when unknown.
+    source_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_mtime_ns: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class JobModel(Base):
