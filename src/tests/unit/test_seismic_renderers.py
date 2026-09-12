@@ -121,8 +121,8 @@ def renderer(request, qapp):
 # --- structural ----------------------------------------------------------------
 
 
-def test_renderer_selector_offers_both_with_matplotlib_first():
-    assert RENDERERS == ["Matplotlib", "PyQtGraph"]
+def test_renderer_selector_offers_both_with_pyqtgraph_first():
+    assert RENDERERS == ["PyQtGraph", "Matplotlib"]
 
 
 def test_workers_import_no_plotting_library():
@@ -353,11 +353,11 @@ def _open(qapp, wait_for_signal):
     return viewer, service
 
 
-def test_viewer_defaults_to_matplotlib_and_offers_pyqtgraph(qapp, wait_for_signal):
+def test_viewer_defaults_to_pyqtgraph_and_offers_matplotlib(qapp, wait_for_signal):
     viewer, _ = _open(qapp, wait_for_signal)
-    assert viewer._renderer_combo.currentText() == "Matplotlib"
+    assert viewer._renderer_combo.currentText() == "PyQtGraph"
     assert [viewer._renderer_combo.itemText(i) for i in range(2)] == RENDERERS
-    assert isinstance(viewer.renderer, MatplotlibSeismicRenderer)
+    assert isinstance(viewer.renderer, PyQtGraphSeismicRenderer)
 
 
 def test_switching_renderer_keeps_state_and_does_no_io_or_worker(qapp, wait_for_signal):
@@ -379,9 +379,9 @@ def test_switching_renderer_keeps_state_and_does_no_io_or_worker(qapp, wait_for_
     )
     old_renderer = viewer.renderer
 
-    viewer._renderer_combo.setCurrentText("PyQtGraph")
+    viewer._renderer_combo.setCurrentText("Matplotlib")
 
-    assert isinstance(viewer.renderer, PyQtGraphSeismicRenderer)
+    assert isinstance(viewer.renderer, MatplotlibSeismicRenderer)
     assert viewer.renderer is not old_renderer
     assert viewer._thread is None  # no worker started
     assert len(service.load_calls) == loads  # no reload
@@ -404,7 +404,10 @@ def test_switching_renderer_keeps_state_and_does_no_io_or_worker(qapp, wait_for_
         -amplitude_limit(section_before, 98.0, 1.5),
         amplitude_limit(section_before, 98.0, 1.5),
     )
-    assert viewer.renderer.cutoff_hz == 30.0
+    assert any(
+        "cutoff 30.0" in line.get_label()
+        for line in viewer.renderer.spectrum_figure.axes[0].get_lines()
+    )
     assert "Trace 14" in viewer._trace_info_label.text()
 
 
@@ -433,8 +436,8 @@ def test_switching_back_and_forth_does_not_duplicate_signal_handlers(
 ):
     viewer, service = _open(qapp, wait_for_signal)
     for _ in range(3):
-        viewer._renderer_combo.setCurrentText("PyQtGraph")
         viewer._renderer_combo.setCurrentText("Matplotlib")
+        viewer._renderer_combo.setCurrentText("PyQtGraph")
     before = service.select_calls
 
     viewer.renderer.coordinate_clicked.emit(1.0)
@@ -449,7 +452,7 @@ def test_closing_the_viewer_disposes_the_active_renderer(qapp, wait_for_signal):
     from PyQt5.QtGui import QCloseEvent
 
     viewer, _ = _open(qapp, wait_for_signal)
-    viewer._renderer_combo.setCurrentText("PyQtGraph")
+    viewer._renderer_combo.setCurrentText("Matplotlib")
     event = QCloseEvent()
 
     viewer.closeEvent(event)

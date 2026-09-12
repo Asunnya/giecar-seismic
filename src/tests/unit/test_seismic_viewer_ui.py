@@ -270,10 +270,15 @@ def test_selecting_a_coordinate_shows_trace_metadata_and_spectrum(
     assert "Trace 1" in text and "crossline 2" in text
     assert "Nyquist 125.0 Hz" in text
     assert "cutoff 30.0 Hz" in text and "order 4" in text
-    assert len(viewer.renderer.trace_figure.axes) == 1
-    spectrum_ax = viewer.renderer.spectrum_figure.axes[0]
-    assert spectrum_ax.get_xlim()[1] == pytest.approx(125.0)
-    assert any("cutoff 30.0" in line.get_label() for line in spectrum_ax.get_lines())
+    # drawn by the default (PyQtGraph) renderer: trace curves populated,
+    # spectrum spans 0..Nyquist with the cutoff line shown
+    renderer = viewer.renderer
+    assert len(renderer._trace_original.getData()[0]) == N_SAMPLES
+    assert renderer.cutoff_hz == 30.0
+    assert renderer._cutoff_line.isVisible()
+    assert renderer._spectrum_plot.getViewBox().viewRange()[0][1] == pytest.approx(
+        125.0
+    )
 
 
 def test_selecting_a_missing_position_reports_it_instead_of_inventing_a_trace(
@@ -289,7 +294,8 @@ def test_selecting_a_missing_position_reports_it_instead_of_inventing_a_trace(
 
     assert viewer._selected is None
     assert "No trace at this position" in viewer._trace_info_label.text()
-    assert len(viewer.renderer.trace_figure.axes) == 0
+    assert len(viewer.renderer._trace_original.getData()[0] or []) == 0
+    assert viewer.renderer.cutoff_hz is None
 
 
 @pytest.mark.parametrize(
@@ -303,17 +309,15 @@ def test_display_modes_draw_the_expected_number_of_panels(
 
     viewer._mode_combo.setCurrentText(mode)
 
-    axes = viewer.renderer.section_figure.axes
-    assert len(axes) == expected_panels
-    assert all(ax.get_ylabel() == "Time (ms)" for ax in axes)
-    assert all(ax.get_xlabel() == "Crossline" for ax in axes)
-    assert all(
-        ax.get_ylim()[0] > ax.get_ylim()[1] for ax in axes
-    )  # time increases downwards
+    plots = viewer.renderer.plots
+    assert len(plots) == expected_panels
+    assert all(p.getAxis("left").labelText == "Time (ms)" for p in plots)
+    assert all(p.getAxis("bottom").labelText == "Crossline" for p in plots)
+    assert all(p.getViewBox().yInverted() for p in plots)  # time increases downwards
+    panels = viewer.renderer.last_panels
+    assert len(panels) == expected_panels
     if mode == "Side-by-side":
-        assert (
-            axes[0].images[0].get_clim() == axes[1].images[0].get_clim()
-        )  # shared scale
+        assert panels[0].levels == panels[1].levels  # shared scale
 
 
 def test_wiggle_mode_draws_lines_instead_of_an_image(qapp, wait_for_signal):
@@ -321,10 +325,15 @@ def test_wiggle_mode_draws_lines_instead_of_an_image(qapp, wait_for_signal):
 
     viewer._wiggle_checkbox.setChecked(True)
 
-    ax = viewer.renderer.section_figure.axes[0]
-    assert len(ax.images) == 0
-    assert len(ax.get_lines()) == len(CROSSLINES)
-    assert ax.get_ylim()[0] > ax.get_ylim()[1]
+    import pyqtgraph as pg
+
+    plot = viewer.renderer.plots[0]
+    assert viewer.renderer.images == []
+    curves = [i for i in plot.listDataItems() if isinstance(i, pg.PlotCurveItem)]
+    # one visible curve + one invisible baseline/positive pair per trace
+    assert len([c for c in curves if c.opts["pen"] is not None]) == len(CROSSLINES)
+    assert viewer.renderer.last_panels[0].wiggle is True
+    assert plot.getViewBox().yInverted()
 
 
 def test_close_is_rejected_while_a_load_is_running(qapp, wait_for_signal):

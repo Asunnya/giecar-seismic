@@ -27,7 +27,11 @@ DISPLAY_MODES = ["Original", "Filtered", "Difference", "Side-by-side"]
 # converts them through pyqtgraph.colormap.getFromMatplotlib, so the two
 # libraries always offer the same list from this single definition.
 COLORMAPS = ["seismic", "gray", "RdBu_r", "viridis"]
-RENDERERS = ["Matplotlib", "PyQtGraph"]
+# First entry is the viewer's default: PyQtGraph redraws a 720 x 850
+# section in ~20-30 ms against ~25-130 ms (and ~700 ms in wiggle mode)
+# for Matplotlib, so navigation feels immediate; Matplotlib stays
+# available for its toolbar/export.
+RENDERERS = ["PyQtGraph", "Matplotlib"]
 # Wiggle draws at most this many traces per panel; beyond it, only every
 # k-th trace is drawn (display-only decimation -- the section is untouched).
 MAX_WIGGLE_TRACES = 200

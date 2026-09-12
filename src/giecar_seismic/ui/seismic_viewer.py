@@ -5,8 +5,8 @@ section view on the left and, on the right, the selected trace's
 metadata, an original-vs-filtered trace overlay and both amplitude
 spectra with the job's cutoff marked.
 
-Rendering is delegated to a SeismicRenderer (Matplotlib or PyQtGraph,
-selectable at runtime). This dialog keeps all state -- orientation, line,
+Rendering is delegated to a SeismicRenderer (PyQtGraph by default,
+Matplotlib selectable at runtime). This dialog keeps all state -- orientation, line,
 display mode, gain, clip, colormap, wiggle, selected trace and its
 spectrum -- and the worker lifecycle; a renderer only draws what it is
 handed. Switching renderer disposes the old one, builds the new one and
@@ -149,7 +149,7 @@ class SeismicViewer(QDialog):
         self._cmap_combo.addItems(COLORMAPS)
         self._cmap_combo.currentIndexChanged.connect(self._redraw)
         self._renderer_combo = QComboBox(self)
-        self._renderer_combo.addItems(RENDERERS)  # default: Matplotlib (first)
+        self._renderer_combo.addItems(RENDERERS)  # default: first entry
         self._renderer_combo.currentIndexChanged.connect(self._on_renderer_changed)
         for label, widget in (
             ("Line:", self._orientation_combo),
