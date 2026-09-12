@@ -79,3 +79,45 @@ def test_missing_log_has_a_clear_error(tmp_path):
 
     with pytest.raises(FileNotFoundError, match="No execution log exists for job 99"):
         read_job_log(tmp_path, 99)
+
+
+def test_concurrent_writes_to_the_same_job_never_attach_two_handlers(
+    tmp_path, monkeypatch
+):
+    # The GUI thread (CANCEL_REQUESTED) and the worker (JOB_CANCELLED) can
+    # log the same job at the same instant. If two FileHandlers were ever
+    # attached to the shared logger at once, one record would be emitted
+    # through both -- a duplicated line.
+    import threading
+
+    threads, per_thread = 8, 20
+    logger = logging.getLogger("giecar.job.77")
+    seen_handler_counts: list[int] = []
+    real_emit = logging.FileHandler.emit
+
+    def counting_emit(self, record):
+        seen_handler_counts.append(len(logger.handlers))
+        real_emit(self, record)
+
+    monkeypatch.setattr(logging.FileHandler, "emit", counting_emit)
+    writer = FileJobExecutionLogger(tmp_path)
+    barrier = threading.Barrier(threads)
+
+    def work(index: int) -> None:
+        barrier.wait()
+        for n in range(per_thread):
+            writer.log(77, JobLogLevel.INFO, "EVENT", f"t{index}-m{n}")
+
+    workers = [threading.Thread(target=work, args=(i,)) for i in range(threads)]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
+
+    lines = read_job_log(tmp_path, 77).splitlines()
+    assert len(lines) == threads * per_thread
+    for index in range(threads):
+        for n in range(per_thread):
+            assert sum(line.endswith(f"EVENT - t{index}-m{n}") for line in lines) == 1
+    assert set(seen_handler_counts) == {1}
+    assert logger.handlers == []
