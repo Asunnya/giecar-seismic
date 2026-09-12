@@ -5,10 +5,13 @@ section view on the left and, on the right, the selected trace's
 metadata, an original-vs-filtered trace overlay and both amplitude
 spectra with the job's cutoff marked.
 
-Rendering is delegated to a SeismicRenderer (Matplotlib). This dialog
-keeps all state -- orientation, line, display mode, gain, clip, colormap,
-wiggle, selected trace and its spectrum -- and the worker lifecycle; a
-renderer only draws what it is handed.
+Rendering is delegated to a SeismicRenderer (Matplotlib or PyQtGraph,
+selectable at runtime). This dialog keeps all state -- orientation, line,
+display mode, gain, clip, colormap, wiggle, selected trace and its
+spectrum -- and the worker lifecycle; a renderer only draws what it is
+handed. Switching renderer disposes the old one, builds the new one and
+redraws the section/trace/spectrum already in memory: no worker, no
+SEG-Y/HDF5 read, no repository query, no FFT.
 
 Threading: every load (geometry index build, section read) runs on a
 QThread via the workers in viewer_workers.py; this dialog only receives
@@ -46,9 +49,11 @@ from giecar_seismic.application.seismic_viewer import (
 )
 from giecar_seismic.domain.geometry import LineOrientation
 from giecar_seismic.ui.matplotlib_renderer import MatplotlibSeismicRenderer
+from giecar_seismic.ui.pyqtgraph_renderer import PyQtGraphSeismicRenderer
 from giecar_seismic.ui.seismic_renderer import (
     COLORMAPS,
     DISPLAY_MODES,
+    RENDERERS,
     DisplaySettings,
     SeismicRenderer,
 )
@@ -59,6 +64,12 @@ from giecar_seismic.ui.viewer_workers import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def make_renderer(name: str) -> SeismicRenderer:
+    if name == "PyQtGraph":
+        return PyQtGraphSeismicRenderer()
+    return MatplotlibSeismicRenderer()
 
 
 # --- the dialog ----------------------------------------------------------------
@@ -137,6 +148,9 @@ class SeismicViewer(QDialog):
         self._cmap_combo = QComboBox(self)
         self._cmap_combo.addItems(COLORMAPS)
         self._cmap_combo.currentIndexChanged.connect(self._redraw)
+        self._renderer_combo = QComboBox(self)
+        self._renderer_combo.addItems(RENDERERS)  # default: Matplotlib (first)
+        self._renderer_combo.currentIndexChanged.connect(self._on_renderer_changed)
         for label, widget in (
             ("Line:", self._orientation_combo),
             ("", self._prev_button),
@@ -147,6 +161,7 @@ class SeismicViewer(QDialog):
             ("Gain:", self._gain_spinbox),
             ("Clip %:", self._clip_spinbox),
             ("Colormap:", self._cmap_combo),
+            ("Renderer:", self._renderer_combo),
         ):
             if label:
                 bar.addWidget(QLabel(label, self))
@@ -169,7 +184,7 @@ class SeismicViewer(QDialog):
         self._analysis_slot = QVBoxLayout()
         trace_layout.addLayout(self._analysis_slot, 1)
 
-        self._install_renderer(MatplotlibSeismicRenderer())
+        self._install_renderer(make_renderer(self._renderer_combo.currentText()))
         splitter = self._splitter
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
@@ -310,6 +325,18 @@ class SeismicViewer(QDialog):
         self._analysis_slot.addWidget(renderer.analysis_widget())
         self._splitter.setStretchFactor(0, 3)
         self._splitter.setStretchFactor(1, 1)
+
+    def _on_renderer_changed(self, _index: int) -> None:
+        # Presentation only: the section, selected trace and its spectrum
+        # are already in memory and are handed to the new renderer as-is.
+        # Viewport (zoom/pan) is reset; nothing else changes.
+        self._renderer_combo.setEnabled(False)
+        try:
+            self._install_renderer(make_renderer(self._renderer_combo.currentText()))
+            self._redraw()
+            self._show_selected_trace()
+        finally:
+            self._renderer_combo.setEnabled(True)
 
     @property
     def renderer(self) -> SeismicRenderer:

@@ -1,12 +1,11 @@
 """Renderer contract for the 2D seismic viewer, plus the display helpers
-a renderer uses so the viewer and the renderer never disagree on *what*
-is drawn.
+both renderers share so they can never disagree on *what* is drawn.
 
 The viewer owns state (orientation, line, mode, gain, clip, colormap,
 wiggle, selected trace, workers); a renderer owns only widgets and how
 the already-loaded SeismicSection / TraceView / TraceSpectrum are drawn.
 Renderers never read SEG-Y/HDF5, never query a repository and never run
-off the GUI thread.
+off the GUI thread. Switching renderer therefore never touches data.
 """
 
 from dataclasses import dataclass
@@ -24,7 +23,11 @@ from giecar_seismic.application.seismic_viewer import (
 from giecar_seismic.domain.geometry import LineOrientation
 
 DISPLAY_MODES = ["Original", "Filtered", "Difference", "Side-by-side"]
+# Exposed to the user by their matplotlib names; the PyQtGraph renderer
+# converts them through pyqtgraph.colormap.getFromMatplotlib, so the two
+# libraries always offer the same list from this single definition.
 COLORMAPS = ["seismic", "gray", "RdBu_r", "viridis"]
+RENDERERS = ["Matplotlib", "PyQtGraph"]
 # Wiggle draws at most this many traces per panel; beyond it, only every
 # k-th trace is drawn (display-only decimation -- the section is untouched).
 MAX_WIGGLE_TRACES = 200
@@ -53,8 +56,8 @@ class PanelRender:
 
 
 class SeismicRenderer(QObject):
-    """Minimal interface the viewer needs. Concrete implementation:
-    MatplotlibSeismicRenderer."""
+    """Minimal interface the viewer needs. Two concrete implementations:
+    MatplotlibSeismicRenderer and PyQtGraphSeismicRenderer."""
 
     # Geometric x coordinate the user clicked on the section (crossline
     # number in inline view, inline number in crossline view). Resolving
@@ -123,7 +126,8 @@ def wiggle_stride(n_present_traces: int, max_traces: int = MAX_WIGGLE_TRACES) ->
 
 def panels_for_mode(section: SeismicSection, mode: str) -> list[tuple[str, np.ndarray]]:
     """(title, data) per panel for a display mode. `data` is a view of the
-    section's own arrays -- never a copy."""
+    section's own arrays -- never a copy -- so both renderers draw the
+    very same memory."""
     line = f"{section.orientation.value} {section.line_number}"
     if mode == "Side-by-side":
         return [

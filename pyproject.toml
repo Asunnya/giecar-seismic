@@ -12,6 +12,7 @@ dependencies = [
     "matplotlib>=3.11.2",
     "numpy>=2.5.3",
     "pyqt5>=5.15.11",
+    "pyqtgraph>=0.14.0",
     "scipy>=1.18.1",
     "segyio>=1.9.14",
     "sqlalchemy>=2.0.52",
@@ -34,6 +35,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "PyQt5.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "pyqtgraph.*"
 ignore_missing_imports = true
 
 [dependency-groups]
