@@ -197,15 +197,15 @@ sequenceDiagram
 ### Requisitos
 
 - Python 3.12 (série `3.12.x`; `requires-python = ">=3.12,<3.13"`).
-- Linux x86_64 ou Windows x86_64 (AMD64).
+- Linux x86_64, Windows x86_64 (AMD64) ou macOS (Intel x86_64 ou Apple Silicon arm64).
 - [uv](https://docs.astral.sh/uv/).
 - Ambiente gráfico compatível com PyQt5 para abrir a aplicação.
 
 Esses ambientes estão declarados em `tool.uv.required-environments` no
 `pyproject.toml`, e o `uv.lock` é resolvido considerando ambos. Isso evita que o
 lock fixe uma dependência binária sem wheel na plataforma de destino (por exemplo,
-`PyQt5-Qt5` é resolvido para `5.15.2` no Windows e `5.15.19` no Linux, ambos dentro
-do intervalo exigido pelo `PyQt5`).
+`PyQt5-Qt5` é resolvido para `5.15.2` no Windows e `5.15.19` no Linux e no macOS,
+todos dentro do intervalo exigido pelo `PyQt5`).
 
 Na raiz do repositório, sincronize o ambiente e as dependências:
 
