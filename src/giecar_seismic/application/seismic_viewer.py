@@ -1,13 +1,16 @@
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import Enum
 from typing import Protocol
 
 import numpy as np
+from scipy.signal import sosfreqz
 
+from giecar_seismic.application.butterworth_filter import butterworth_sos
 from giecar_seismic.application.filter_jobs import DatasetRepository, JobRepository
 from giecar_seismic.domain.dataset import SeismicDataset
 from giecar_seismic.domain.geometry import LineOrientation, TraceGeometry
-from giecar_seismic.domain.job import Job, JobStatus
+from giecar_seismic.domain.job import FilterType, Job, JobStatus
 
 # Guardrail for surveys much larger than the sample: one section is
 # (traces on the line) x n_samples and must stay a few MB, never the
@@ -104,6 +107,17 @@ class TraceView:
     job: Job
 
 
+class SpectrumScale(Enum):
+    LINEAR = "Linear"
+    DB = "dB"
+
+
+@dataclass(frozen=True)
+class CutoffMarker:
+    frequency_hz: float
+    label: str
+
+
 @dataclass(frozen=True)
 class TraceSpectrum:
     frequencies_hz: np.ndarray  # 0 .. nyquist
@@ -111,6 +125,79 @@ class TraceSpectrum:
     filtered: np.ndarray
     nyquist_hz: float
     cutoff_hz: float
+    filter_type: FilterType = FilterType.LOW_PASS
+    upper_cutoff_hz: float | None = None
+    filter_response: np.ndarray | None = None  # zero-phase gain, |H|²
+    scale: SpectrumScale = SpectrumScale.LINEAR
+    show_filter_response: bool = False
+    reference_magnitude: float = 1.0
+
+    @property
+    def cutoff_markers(self) -> tuple[CutoffMarker, ...]:
+        if self.filter_type is FilterType.LOW_PASS:
+            return (CutoffMarker(self.cutoff_hz, "High cutoff"),)
+        low = CutoffMarker(self.cutoff_hz, "Low cutoff")
+        if self.filter_type is FilterType.BAND_PASS:
+            assert self.upper_cutoff_hz is not None
+            return (low, CutoffMarker(self.upper_cutoff_hz, "High cutoff"))
+        return (low,)
+
+    @property
+    def magnitude_label(self) -> str:
+        return (
+            "Magnitude (dB re original peak)"
+            if self.scale is SpectrumScale.DB
+            else "|Amplitude|"
+        )
+
+    @property
+    def response_label(self) -> str:
+        return "Filter gain (dB)" if self.scale is SpectrumScale.DB else "Filter gain"
+
+
+def _magnitude_db(magnitude: np.ndarray, reference: float) -> np.ndarray:
+    # Work in log space to avoid under/overflow when dividing tiny/large
+    # magnitudes. Clamp at -120 dB (amplitude ratio 1e-6), never log(0).
+    tiny = np.finfo(np.float64).tiny
+    return np.maximum(
+        20 * (np.log10(np.maximum(magnitude, tiny)) - np.log10(reference)), -120.0
+    )
+
+
+def spectrum_for_display(
+    spectrum: TraceSpectrum, scale: SpectrumScale, *, show_filter_response: bool = False
+) -> TraceSpectrum:
+    """Transform a cached *linear* spectrum without FFT, I/O or workers.
+
+    Both curves use the original's peak as the same dB reference (0 dB).
+    For an all-zero original, use fixed reference 1. Response is a gain
+    relative to unity and is drawn on a separate Y axis, never normalized
+    to either trace. Always transform the raw spectrum, not a previous dB
+    result, so repeated toggles cannot accumulate conversion errors.
+    """
+    if spectrum.scale is not SpectrumScale.LINEAR:
+        raise ValueError("spectrum_for_display requires a raw linear spectrum")
+    peak = float(np.max(spectrum.original))
+    reference = max(peak, np.finfo(np.float64).tiny) if peak > 0 else 1.0
+    original, filtered, response = (
+        spectrum.original,
+        spectrum.filtered,
+        spectrum.filter_response,
+    )
+    if scale is SpectrumScale.DB:
+        original = _magnitude_db(original, reference)
+        filtered = _magnitude_db(filtered, reference)
+        if response is not None:
+            response = _magnitude_db(response, 1.0)
+    return replace(
+        spectrum,
+        original=original,
+        filtered=filtered,
+        filter_response=response,
+        scale=scale,
+        show_filter_response=show_filter_response,
+        reference_magnitude=reference,
+    )
 
 
 @dataclass(frozen=True)
@@ -253,10 +340,21 @@ class SeismicViewerService:
         fs_hz = 1000 / view.dataset.sample_rate_ms
         n = view.original.shape[0]
         frequencies = np.fft.rfftfreq(n, d=1 / fs_hz)
+        sos = butterworth_sos(
+            view.job.cutoff_hz,
+            view.job.order,
+            view.dataset.sample_rate_ms,
+            filter_type=view.job.filter_type,
+            upper_cutoff_hz=view.job.upper_cutoff_hz,
+        )
+        _, response = sosfreqz(sos, worN=frequencies, fs=fs_hz)
         return TraceSpectrum(
             frequencies_hz=frequencies,
             original=np.abs(np.fft.rfft(view.original)),
             filtered=np.abs(np.fft.rfft(view.filtered)),
             nyquist_hz=fs_hz / 2,
             cutoff_hz=view.job.cutoff_hz,
+            filter_type=view.job.filter_type,
+            upper_cutoff_hz=view.job.upper_cutoff_hz,
+            filter_response=np.abs(response) ** 2,
         )

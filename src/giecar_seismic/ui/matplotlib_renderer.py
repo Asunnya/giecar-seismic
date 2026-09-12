@@ -35,6 +35,7 @@ class MatplotlibSeismicRenderer(SeismicRenderer):
         super().__init__()
         self.last_panels: list[PanelRender] = []
         self.last_render_seconds = 0.0
+        self.last_spectrum: TraceSpectrum | None = None
 
         self._section_panel = QWidget()
         layout = QVBoxLayout(self._section_panel)
@@ -136,6 +137,7 @@ class MatplotlibSeismicRenderer(SeismicRenderer):
     def show_trace(
         self, view: TraceView | None, spectrum: TraceSpectrum | None
     ) -> None:
+        self.last_spectrum = spectrum
         self._trace_figure.clear()
         self._spectrum_figure.clear()
         if view is not None:
@@ -163,15 +165,28 @@ class MatplotlibSeismicRenderer(SeismicRenderer):
                 label="filtered",
                 linewidth=0.8,
             )
-            ax.axvline(
-                spectrum.cutoff_hz,
-                color="red",
-                linestyle="--",
-                label=f"cutoff {spectrum.cutoff_hz} Hz",
-            )
+            for marker in spectrum.cutoff_markers:
+                ax.axvline(
+                    marker.frequency_hz,
+                    color="red",
+                    linestyle="--",
+                    label=f"{marker.label} {marker.frequency_hz} Hz",
+                )
+            if spectrum.show_filter_response and spectrum.filter_response is not None:
+                response_ax = ax.twinx()
+                response_ax.plot(
+                    spectrum.frequencies_hz,
+                    spectrum.filter_response,
+                    color="green",
+                    linestyle=":",
+                    label="Filter response (zero-phase)",
+                )
+                response_ax.set_ylabel(spectrum.response_label, color="green")
+                response_ax.tick_params(axis="y", colors="green")
+                response_ax.legend(loc="lower left", fontsize="small")
             ax.set_xlim(0.0, spectrum.nyquist_hz)
             ax.set_xlabel("Frequency (Hz)")
-            ax.set_ylabel("|Amplitude|")
+            ax.set_ylabel(spectrum.magnitude_label)
             ax.set_title("Amplitude spectrum")
             ax.legend(loc="upper right", fontsize="small")
         self._trace_canvas.draw_idle()

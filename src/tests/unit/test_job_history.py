@@ -314,7 +314,8 @@ def test_table_columns_include_created_at():
     assert JOBS_TABLE_HEADERS == [
         "ID",
         "Dataset",
-        "Cutoff (Hz)",
+        "Filter",
+        "Cutoff(s)",
         "Order",
         "Status",
         "Progress",

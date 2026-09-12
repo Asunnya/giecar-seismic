@@ -3,6 +3,12 @@ from datetime import datetime
 from enum import Enum, auto
 
 
+class FilterType(Enum):
+    LOW_PASS = auto()
+    HIGH_PASS = auto()
+    BAND_PASS = auto()
+
+
 class JobStatus(Enum):
     CREATED = auto()
     RUNNING = auto()
@@ -37,6 +43,8 @@ class Job:
     started_at: datetime | None = None
     finished_at: datetime | None = None
     id: int | None = None
+    filter_type: FilterType = FilterType.LOW_PASS
+    upper_cutoff_hz: float | None = None
 
     def _transition(
         self, action: str, expected: JobStatus, new_status: JobStatus

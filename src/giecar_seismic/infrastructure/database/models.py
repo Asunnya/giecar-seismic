@@ -57,6 +57,10 @@ class JobModel(Base):
     dataset_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("datasets.id"), nullable=False
     )
+    filter_type: Mapped[str] = mapped_column(
+        String, nullable=False, default="LOW_PASS", server_default="LOW_PASS"
+    )
+    upper_cutoff_hz: Mapped[float | None] = mapped_column(Float, nullable=True)
     cutoff_hz: Mapped[float] = mapped_column(Float, nullable=False)
     order: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False)

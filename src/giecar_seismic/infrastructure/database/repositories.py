@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from giecar_seismic.domain.dataset import SeismicDataset, SourceFingerprint
 from giecar_seismic.domain.geometry import TraceGeometry
-from giecar_seismic.domain.job import Job, JobStatus
+from giecar_seismic.domain.job import FilterType, Job, JobStatus
 from giecar_seismic.infrastructure.database.models import (
     DatasetModel,
     JobModel,
@@ -73,6 +73,8 @@ def _job_to_domain(model: JobModel) -> Job:
         id=model.id,
         dataset_id=model.dataset_id,
         cutoff_hz=model.cutoff_hz,
+        filter_type=FilterType[model.filter_type],
+        upper_cutoff_hz=model.upper_cutoff_hz,
         order=model.order,
         status=JobStatus[model.status],
         error_message=model.error_message,
@@ -89,6 +91,8 @@ def _job_to_model(job: Job) -> JobModel:
         id=job.id,
         dataset_id=job.dataset_id,
         cutoff_hz=job.cutoff_hz,
+        filter_type=job.filter_type.name,
+        upper_cutoff_hz=job.upper_cutoff_hz,
         order=job.order,
         status=job.status.name,
         error_message=job.error_message,
@@ -152,6 +156,8 @@ class SqlAlchemyJobRepository:
                 raise LookupError(f"job {job.id} not found")
             model.dataset_id = job.dataset_id
             model.cutoff_hz = job.cutoff_hz
+            model.filter_type = job.filter_type.name
+            model.upper_cutoff_hz = job.upper_cutoff_hz
             model.order = job.order
             model.status = job.status.name
             model.error_message = job.error_message

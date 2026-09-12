@@ -91,6 +91,7 @@ class SeismicRenderer(QObject):
 
     # Filled in by implementations after each show_section(); exposed for
     # tests and for the manual rendering-time measurement.
+    last_spectrum: TraceSpectrum | None
     last_panels: list[PanelRender]
     last_render_seconds: float
 

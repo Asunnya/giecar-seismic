@@ -44,10 +44,13 @@ from PyQt5.QtWidgets import (
 from giecar_seismic.application.seismic_viewer import (
     SeismicSection,
     SeismicViewerService,
+    SpectrumScale,
     TraceSpectrum,
     TraceView,
+    spectrum_for_display,
 )
 from giecar_seismic.domain.geometry import LineOrientation
+from giecar_seismic.ui.filter_labels import FILTER_LABELS, FILTER_NAMES, cutoff_summary
 from giecar_seismic.ui.matplotlib_renderer import MatplotlibSeismicRenderer
 from giecar_seismic.ui.pyqtgraph_renderer import PyQtGraphSeismicRenderer
 from giecar_seismic.ui.seismic_renderer import (
@@ -92,6 +95,7 @@ class SeismicViewer(QDialog):
         self._section: SeismicSection | None = None
         self._selected: TraceView | None = None
         self._selected_spectrum: TraceSpectrum | None = None
+        self._display_spectrum: TraceSpectrum | None = None
         self._renderer: SeismicRenderer | None = None
         self._section_was_clicked = False
         # A line requested while a thread is still winding down (e.g. the
@@ -105,7 +109,8 @@ class SeismicViewer(QDialog):
 
         self.setWindowTitle(
             f"Seismic viewer -- job {job_id} ({self._context.dataset.name}, "
-            f"cutoff {self._context.job.cutoff_hz} Hz, order {self._context.job.order})"
+            f"{FILTER_NAMES[self._context.job.filter_type]} {cutoff_summary(self._context.job)}, "
+            f"order {self._context.job.order})"
         )
         self.resize(1400, 800)
         self._build_ui()
@@ -181,6 +186,24 @@ class SeismicViewer(QDialog):
         )
         self._trace_info_label.setWordWrap(True)
         trace_layout.addWidget(self._trace_info_label)
+        spectrum_bar = QHBoxLayout()
+        self._spectrum_scale_combo = QComboBox(self)
+        self._spectrum_scale_combo.addItems([scale.value for scale in SpectrumScale])
+        self._spectrum_scale_combo.setToolTip(
+            "dB uses the original spectrum peak as a common reference for both curves; floor -120 dB."
+        )
+        self._spectrum_scale_combo.currentIndexChanged.connect(
+            self._on_spectrum_settings_changed
+        )
+        self._response_checkbox = QCheckBox("Show filter response", self)
+        self._response_checkbox.setToolTip(
+            "Ideal zero-phase gain |H|² from the processing SOS, on the separate right axis."
+        )
+        self._response_checkbox.toggled.connect(self._on_spectrum_settings_changed)
+        spectrum_bar.addWidget(QLabel("Spectrum scale:", self))
+        spectrum_bar.addWidget(self._spectrum_scale_combo)
+        trace_layout.addLayout(spectrum_bar)
+        trace_layout.addWidget(self._response_checkbox)
         self._analysis_slot = QVBoxLayout()
         trace_layout.addLayout(self._analysis_slot, 1)
 
@@ -298,6 +321,7 @@ class SeismicViewer(QDialog):
         self._section = section
         self._selected = None
         self._selected_spectrum = None
+        self._display_spectrum = None
         self._section_was_clicked = False
         self._status_label.setText(
             f"{section.orientation.value.capitalize()} {section.line_number}: "
@@ -374,6 +398,18 @@ class SeismicViewer(QDialog):
         self._selected_spectrum = (
             self._service.spectrum(view) if view is not None else None
         )
+        self._on_spectrum_settings_changed()
+
+    def _on_spectrum_settings_changed(self, *_args: object) -> None:
+        self._display_spectrum = (
+            spectrum_for_display(
+                self._selected_spectrum,
+                SpectrumScale(self._spectrum_scale_combo.currentText()),
+                show_filter_response=self._response_checkbox.isChecked(),
+            )
+            if self._selected_spectrum is not None
+            else None
+        )
         self._show_selected_trace()
 
     def _show_selected_trace(self) -> None:
@@ -386,12 +422,18 @@ class SeismicViewer(QDialog):
             )
         else:
             g, d, j = view.geometry, view.dataset, view.job
+            assert self._selected_spectrum is not None
+            cutoffs = ", ".join(
+                f"{marker.label} {marker.frequency_hz} Hz"
+                for marker in self._selected_spectrum.cutoff_markers
+            )
             self._trace_info_label.setText(
                 f"Trace {g.trace_index}  |  inline {g.inline}, crossline {g.crossline}\n"
                 f"{d.n_samples} samples @ {d.sample_rate_ms} ms  (Nyquist {d.nyquist_hz:.1f} Hz)\n"
-                f"Job {j.id}: cutoff {j.cutoff_hz} Hz, order {j.order}"
+                f"Job {j.id}: Filter type: {FILTER_LABELS[j.filter_type]}\n"
+                f"{cutoffs}, order {j.order}"
             )
-        self.renderer.show_trace(view, self._selected_spectrum)
+        self.renderer.show_trace(view, self._display_spectrum)
 
     # -- shutdown ------------------------------------------------------------------
 

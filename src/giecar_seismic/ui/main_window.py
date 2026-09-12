@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from datetime import datetime
+from math import ceil
 from pathlib import Path
 
 from PyQt5.QtCore import QThread, QTimer, QUrl, pyqtSignal
@@ -26,9 +27,11 @@ from PyQt5.QtWidgets import (
 from giecar_seismic.application.filter_jobs import (
     CooperativeCancelToken,
     FilterJobService,
+    InvalidFilterParametersError,
 )
 from giecar_seismic.domain.dataset import SeismicDataset
-from giecar_seismic.domain.job import Job, JobStatus
+from giecar_seismic.domain.job import FilterType, Job, JobStatus
+from giecar_seismic.ui.filter_labels import FILTER_LABELS, FILTER_NAMES, cutoff_summary
 from giecar_seismic.ui.workers import (
     DatasetImporter,
     FilterJobWorker,
@@ -40,7 +43,8 @@ from giecar_seismic.ui.workers import (
 JOBS_TABLE_HEADERS = [
     "ID",
     "Dataset",
-    "Cutoff (Hz)",
+    "Filter",
+    "Cutoff(s)",
     "Order",
     "Status",
     "Progress",
@@ -142,6 +146,7 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("GIECAR Seismic Filter")
         self._build_ui()
+        self._update_filter_controls()
         self._refresh_controls()
         self._history_loaded_once = False
         self._history_result_pending = False
@@ -196,11 +201,34 @@ class MainWindow(QMainWindow):
         group = QGroupBox("Filter", self)
         form = QFormLayout(group)
 
+        self._filter_type_combo = QComboBox(group)
+        for kind in FilterType:
+            self._filter_type_combo.addItem(FILTER_LABELS[kind], kind)
+        form.addRow("Filter type:", self._filter_type_combo)
+
         self._cutoff_spinbox = QDoubleSpinBox(group)
         self._cutoff_spinbox.setDecimals(2)
         self._cutoff_spinbox.setRange(0.01, 1_000_000.0)
         self._cutoff_spinbox.setValue(30.0)
-        form.addRow("Cutoff (Hz):", self._cutoff_spinbox)
+        self._cutoff_label = QLabel("High cutoff (Hz):", group)
+        form.addRow(self._cutoff_label, self._cutoff_spinbox)
+        self._upper_cutoff_spinbox = QDoubleSpinBox(group)
+        self._upper_cutoff_spinbox.setDecimals(2)
+        self._upper_cutoff_spinbox.setRange(0.02, 1_000_000.0)
+        self._upper_cutoff_spinbox.setValue(40.0)
+        self._upper_cutoff_label = QLabel("High cutoff (Hz):", group)
+        form.addRow(self._upper_cutoff_label, self._upper_cutoff_spinbox)
+        self._band_hint = QLabel(
+            "Band-pass requires low < high < Nyquist. Raise high first to raise low.",
+            group,
+        )
+        self._band_hint.setWordWrap(True)
+        form.addRow(self._band_hint)
+        self._filter_type_combo.currentIndexChanged.connect(
+            self._update_filter_controls
+        )
+        self._cutoff_spinbox.valueChanged.connect(self._update_filter_controls)
+        self._upper_cutoff_spinbox.valueChanged.connect(self._update_filter_controls)
 
         self._order_spinbox = QSpinBox(group)
         self._order_spinbox.setRange(2, 8)
@@ -385,11 +413,44 @@ class MainWindow(QMainWindow):
         # nyquist_hz -- FilterJobService.create_filter_job remains the
         # actual enforcement point; this only steers the widget away from
         # an obviously invalid value before it ever reaches the service.
-        max_cutoff = max(CUTOFF_EPSILON_HZ, dataset.nyquist_hz - CUTOFF_EPSILON_HZ)
-        self._cutoff_spinbox.setMaximum(max_cutoff)
-        if self._cutoff_spinbox.value() > max_cutoff:
-            self._cutoff_spinbox.setValue(max_cutoff)
+        self._update_filter_controls()
 
+        self._refresh_controls()
+
+    @property
+    def filter_type(self) -> FilterType:
+        return self._filter_type_combo.currentData()
+
+    def _update_filter_controls(self, *_args: object) -> None:
+        band = self.filter_type is FilterType.BAND_PASS
+        self._cutoff_label.setText(
+            "High cutoff (Hz):"
+            if self.filter_type is FilterType.LOW_PASS
+            else "Low cutoff (Hz):"
+        )
+        self._upper_cutoff_spinbox.setVisible(band)
+        self._upper_cutoff_label.setVisible(band)
+        self._band_hint.setVisible(band)
+        # Largest representable hundredth strictly below Nyquist, even
+        # when Nyquist itself is not a multiple of the widget precision.
+        maximum = (
+            (ceil(self._dataset.nyquist_hz * 100) - 1) / 100
+            if self._dataset is not None
+            else 1_000_000.0
+        )
+        low, high = self._cutoff_spinbox, self._upper_cutoff_spinbox
+        low.blockSignals(True)
+        high.blockSignals(True)
+        try:
+            low.setRange(CUTOFF_EPSILON_HZ, max(CUTOFF_EPSILON_HZ, maximum))
+            high.setRange(CUTOFF_EPSILON_HZ, max(CUTOFF_EPSILON_HZ, maximum))
+            if band and maximum >= 2 * CUTOFF_EPSILON_HZ:
+                low.setMaximum(maximum - CUTOFF_EPSILON_HZ)
+                high.setMinimum(low.value() + CUTOFF_EPSILON_HZ)
+                low.setMaximum(high.value() - CUTOFF_EPSILON_HZ)
+        finally:
+            low.blockSignals(False)
+            high.blockSignals(False)
         self._refresh_controls()
 
     # -- Run / Cancel ----------------------------------------------------
@@ -403,6 +464,13 @@ class MainWindow(QMainWindow):
             self._service is not None
             and self._dataset is not None
             and self._dataset.id is not None
+            and 0 < self._cutoff_spinbox.value() < self._dataset.nyquist_hz
+            and (
+                self.filter_type is not FilterType.BAND_PASS
+                or self._cutoff_spinbox.value()
+                < self._upper_cutoff_spinbox.value()
+                < self._dataset.nyquist_hz
+            )
         )
 
     def _refresh_controls(self) -> None:
@@ -423,11 +491,21 @@ class MainWindow(QMainWindow):
         assert dataset is not None
         assert dataset.id is not None
 
-        job = service.create_filter_job(
-            dataset_id=dataset.id,
-            cutoff_hz=self._cutoff_spinbox.value(),
-            order=self._order_spinbox.value(),
-        )
+        try:
+            job = service.create_filter_job(
+                dataset_id=dataset.id,
+                cutoff_hz=self._cutoff_spinbox.value(),
+                order=self._order_spinbox.value(),
+                filter_type=self.filter_type,
+                upper_cutoff_hz=(
+                    self._upper_cutoff_spinbox.value()
+                    if self.filter_type is FilterType.BAND_PASS
+                    else None
+                ),
+            )
+        except InvalidFilterParametersError as exc:
+            self._status_label.setText(f"Invalid filter: {exc}")
+            return
         self._register_session_dataset(dataset)
         self._insert_job_row(0, job)  # newest first, like the persisted history
         assert job.id is not None
@@ -686,7 +764,8 @@ class MainWindow(QMainWindow):
         values = [
             str(job.id),
             self._dataset_label(job.dataset_id),
-            str(job.cutoff_hz),
+            FILTER_NAMES[job.filter_type],
+            cutoff_summary(job),
             str(job.order),
             job.status.name,
             format_progress(job.progress),

@@ -41,6 +41,7 @@ class PyQtGraphSeismicRenderer(SeismicRenderer):
         super().__init__()
         self.last_panels: list[PanelRender] = []
         self.last_render_seconds = 0.0
+        self.last_spectrum: TraceSpectrum | None = None
 
         self._section_panel = QWidget()
         layout = QVBoxLayout(self._section_panel)
@@ -57,7 +58,7 @@ class PyQtGraphSeismicRenderer(SeismicRenderer):
         self._trace_plot.invertY(True)
         self._trace_plot.setLabel("bottom", "Amplitude")
         self._trace_plot.setLabel("left", "Time (ms)")
-        self._trace_plot.addLegend()
+        self._trace_plot.addLegend(labelTextColor="k", brush=(255, 255, 255, 220))
         self._trace_original = self._trace_plot.plot(
             pen=pg.mkPen("#1f77b4"), name="original"
         )
@@ -67,7 +68,7 @@ class PyQtGraphSeismicRenderer(SeismicRenderer):
         self._spectrum_plot = pg.PlotWidget(background="w")
         self._spectrum_plot.setLabel("bottom", "Frequency (Hz)")
         self._spectrum_plot.setLabel("left", "|Amplitude|")
-        self._spectrum_plot.addLegend()
+        self._spectrum_plot.addLegend(labelTextColor="k", brush=(255, 255, 255, 220))
         self._spectrum_original = self._spectrum_plot.plot(
             pen=pg.mkPen("#1f77b4"), name="original"
         )
@@ -78,8 +79,35 @@ class PyQtGraphSeismicRenderer(SeismicRenderer):
             angle=90,
             pen=pg.mkPen("r", style=pg.QtCore.Qt.PenStyle.DashLine),
             label="cutoff",
+            labelOpts={"position": 0.15, "color": "#a00000"},
         )
-        self._spectrum_plot.addItem(self._cutoff_line)
+        self._cutoff_lines = [
+            self._cutoff_line,
+            pg.InfiniteLine(
+                angle=90,
+                pen=pg.mkPen("r", style=pg.QtCore.Qt.PenStyle.DashLine),
+                label="High cutoff",
+                labelOpts={"position": 0.35, "color": "#a00000"},
+            ),
+        ]
+        for line in self._cutoff_lines:
+            self._spectrum_plot.addItem(line)
+            line.hide()
+        # Independent gain axis: a normalized response must never share
+        # the amplitude scale of an absolute FFT spectrum.
+        plot_item = self._spectrum_plot.getPlotItem()
+        self._response_view = pg.ViewBox()
+        plot_item.scene().addItem(self._response_view)
+        plot_item.getAxis("right").linkToView(self._response_view)
+        self._response_view.setXLink(plot_item.vb)
+        self._response_curve = pg.PlotCurveItem(
+            pen=pg.mkPen("green", style=pg.QtCore.Qt.PenStyle.DotLine)
+        )
+        self._response_view.addItem(self._response_curve)
+        plot_item.vb.sigResized.connect(self._sync_response_geometry)
+        self._sync_response_geometry()
+        self._response_curve.hide()
+        self._response_view.hide()
         for plot_widget in (self._trace_plot, self._spectrum_plot):
             _darken_axes(plot_widget.getPlotItem())
         analysis_layout.addWidget(self._trace_plot)
@@ -154,6 +182,7 @@ class PyQtGraphSeismicRenderer(SeismicRenderer):
     def show_trace(
         self, view: TraceView | None, spectrum: TraceSpectrum | None
     ) -> None:
+        self.last_spectrum = spectrum
         if view is None:
             self._trace_original.setData([], [])
             self._trace_filtered.setData([], [])
@@ -168,19 +197,61 @@ class PyQtGraphSeismicRenderer(SeismicRenderer):
         if spectrum is None:
             self._spectrum_original.setData([], [])
             self._spectrum_filtered.setData([], [])
-            self._cutoff_line.hide()
+            for line in self._cutoff_lines:
+                line.hide()
             self.cutoff_hz = None
         else:
             self._spectrum_original.setData(spectrum.frequencies_hz, spectrum.original)
             self._spectrum_filtered.setData(spectrum.frequencies_hz, spectrum.filtered)
-            self._cutoff_line.setPos(spectrum.cutoff_hz)
-            self._cutoff_line.label.setFormat(f"cutoff {spectrum.cutoff_hz} Hz")
-            self._cutoff_line.show()
+            for line in self._cutoff_lines:
+                line.hide()
+            for line, marker in zip(self._cutoff_lines, spectrum.cutoff_markers):
+                # InfLineLabel skips text updates while its parent is hidden.
+                line.show()
+                line.setPos(marker.frequency_hz)
+                line.label.setFormat(f"{marker.label} {marker.frequency_hz} Hz")
+            self._spectrum_plot.setLabel("left", spectrum.magnitude_label)
             self._spectrum_plot.setXRange(0.0, spectrum.nyquist_hz, padding=0)
             self._spectrum_plot.setTitle("Amplitude spectrum")
             self.cutoff_hz = spectrum.cutoff_hz
 
+        plot_item = self._spectrum_plot.getPlotItem()
+        plot_item.legend.removeItem("Filter response (zero-phase)")
+        show_response = (
+            spectrum is not None
+            and spectrum.show_filter_response
+            and spectrum.filter_response is not None
+        )
+        self._response_curve.setVisible(show_response)
+        self._response_view.setVisible(show_response)
+        plot_item.showAxis("right", show_response)
+        if show_response:
+            assert spectrum is not None
+            self._response_curve.setData(
+                spectrum.frequencies_hz, spectrum.filter_response
+            )
+            plot_item.setLabel("right", spectrum.response_label, color="green")
+            plot_item.getAxis("right").setPen(pg.mkPen("green"))
+            plot_item.getAxis("right").setTextPen(pg.mkPen("green"))
+            plot_item.legend.addItem(
+                self._response_curve, "Filter response (zero-phase)"
+            )
+            self._response_view.enableAutoRange(axis=pg.ViewBox.YAxis)
+            self._sync_response_geometry()
+        else:
+            self._response_curve.setData([], [])
+
+    def _sync_response_geometry(self) -> None:
+        view = self._spectrum_plot.getViewBox()
+        self._response_view.setGeometry(view.sceneBoundingRect())
+        self._response_view.linkedViewChanged(view, self._response_view.XAxis)
+
     def dispose(self) -> None:
+        self._spectrum_plot.getViewBox().sigResized.disconnect(
+            self._sync_response_geometry
+        )
+        self._response_view.setXLink(None)
+        self._spectrum_plot.getPlotItem().scene().removeItem(self._response_view)
         self._layout_widget.scene().sigMouseClicked.disconnect(self._on_scene_clicked)
         self._layout_widget.clear()
         for widget in (self._section_panel, self._analysis_panel):

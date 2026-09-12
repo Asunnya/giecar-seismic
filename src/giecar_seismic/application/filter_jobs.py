@@ -4,9 +4,9 @@ from typing import Protocol
 
 import numpy as np
 
-from giecar_seismic.application.butterworth_filter import apply_lowpass_filter
+from giecar_seismic.application.butterworth_filter import apply_butterworth_filter
 from giecar_seismic.domain.dataset import SeismicDataset
-from giecar_seismic.domain.job import InvalidTransitionError, Job, JobStatus
+from giecar_seismic.domain.job import FilterType, InvalidTransitionError, Job, JobStatus
 
 
 class DatasetRepository(Protocol):
@@ -222,7 +222,15 @@ class FilterJobService:
         self._cancel_tokens: dict[int, _RunRegistration] = {}
         self._cancel_tokens_lock = threading.Lock()
 
-    def create_filter_job(self, dataset_id: int, cutoff_hz: float, order: int) -> Job:
+    def create_filter_job(
+        self,
+        dataset_id: int,
+        cutoff_hz: float,
+        order: int,
+        *,
+        filter_type: FilterType = FilterType.LOW_PASS,
+        upper_cutoff_hz: float | None = None,
+    ) -> Job:
         dataset = self._datasets.get(dataset_id)
         if dataset is None:
             raise DatasetNotFoundError(f"dataset {dataset_id} not found")
@@ -233,13 +241,40 @@ class FilterJobService:
                 f"frequency ({dataset.nyquist_hz} Hz), got {cutoff_hz}"
             )
 
-        if not (MIN_FILTER_ORDER <= order <= MAX_FILTER_ORDER):
+        if not isinstance(filter_type, FilterType):
+            raise InvalidFilterParametersError(
+                "filter_type must be a FilterType member"
+            )
+        if filter_type is FilterType.BAND_PASS:
+            if upper_cutoff_hz is None or not (
+                cutoff_hz < upper_cutoff_hz < dataset.nyquist_hz
+            ):
+                raise InvalidFilterParametersError(
+                    "upper_cutoff_hz is required for BAND_PASS and must satisfy "
+                    f"cutoff_hz < upper_cutoff_hz < Nyquist ({dataset.nyquist_hz} Hz)"
+                )
+        elif upper_cutoff_hz is not None:
+            raise InvalidFilterParametersError(
+                "upper_cutoff_hz must be None for LOW_PASS and HIGH_PASS"
+            )
+
+        if (
+            isinstance(order, bool)
+            or not isinstance(order, int)
+            or not MIN_FILTER_ORDER <= order <= MAX_FILTER_ORDER
+        ):
             raise InvalidFilterParametersError(
                 f"order must be between {MIN_FILTER_ORDER} and "
                 f"{MAX_FILTER_ORDER}, got {order}"
             )
 
-        job = Job(dataset_id=dataset_id, cutoff_hz=cutoff_hz, order=order)
+        job = Job(
+            dataset_id=dataset_id,
+            cutoff_hz=cutoff_hz,
+            order=order,
+            filter_type=filter_type,
+            upper_cutoff_hz=upper_cutoff_hz,
+        )
         return self._jobs.add(job)
 
     def list_jobs(
@@ -342,8 +377,7 @@ class FilterJobService:
         with self._cancel_tokens_lock:
             if job_id in self._cancel_tokens:
                 raise JobAlreadyRunningError(
-                    f"job {job_id} already has an active run_filter_job() "
-                    "execution"
+                    f"job {job_id} already has an active run_filter_job() execution"
                 )
             registration = _RunRegistration(cancel_token)
             self._cancel_tokens[job_id] = registration
@@ -393,8 +427,13 @@ class FilterJobService:
 
                     stop = min(start + self._chunk_size, trace_count)
                     chunk = reader.read_chunk(start, stop)
-                    filtered = apply_lowpass_filter(
-                        chunk, job.cutoff_hz, job.order, dataset.sample_rate_ms
+                    filtered = apply_butterworth_filter(
+                        chunk,
+                        job.cutoff_hz,
+                        job.order,
+                        dataset.sample_rate_ms,
+                        filter_type=job.filter_type,
+                        upper_cutoff_hz=job.upper_cutoff_hz,
                     )
                     writer.write_chunk(start, filtered)
                     # Progress is processed / *physical* trace_count (from
