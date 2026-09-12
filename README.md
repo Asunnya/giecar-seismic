@@ -42,16 +42,16 @@ original × filtrado no visualizador (animação em 2× de velocidade).
 - Multiprocessing opcional apenas na filtragem de grupos de traços dentro de cada
   chunk, preservando a ordem física na saída.
 - Viewer sísmico para linhas inline e crossline, com dados originais, filtrados e
-  diferença.
+  diferença; **View Output** abre direto na seção filtrada.
 - Exibição raster ou wiggle, ajuste de ganho, clip e mapa de cores.
 - Renderização com PyQtGraph ou Matplotlib.
 - Espectro do traço selecionado em escala linear ou dB, com frequências de corte
   e resposta teórica do filtro.
 - Janela de Spectrum maior e não modal, sincronizada com a seleção do viewer.
 - **Preview** dos parâmetros antes de rodar o job: o botão **Preview** do grupo
-  Filter abre o mesmo viewer com o dataset importado e aplica o filtro
-  configurado (tipo, cortes e ordem) em memória apenas à seção em tela, usando o
-  mesmo projeto SOS do job. Nada é persistido: nenhum job é criado e nenhum HDF5
+  Filter abre o mesmo viewer com o dataset importado (na seção original) e aplica
+  o filtro configurado (tipo, cortes e ordem) em memória apenas à seção em tela,
+  usando o mesmo projeto SOS do job. Nada é persistido: nenhum job é criado e nenhum HDF5
   é escrito; a memória fica limitada a uma linha (`max_section_traces ×
   n_samples`), nunca ao volume. Os parâmetros passam pela mesma validação de
   `create_filter_job`, então o preview nunca mostra um filtro que o job

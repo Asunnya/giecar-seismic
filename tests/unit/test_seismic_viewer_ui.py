@@ -321,6 +321,18 @@ def test_display_modes_draw_the_expected_number_of_panels(
         assert panels[0].levels == panels[1].levels  # shared scale
 
 
+def test_view_output_opens_on_the_filtered_section(qapp, wait_for_signal):
+    # The job target exists to show the result: the very first automatic
+    # render (not just the combo label) is the filtered panel.
+    viewer, _, _ = _open(qapp, wait_for_signal)
+
+    assert viewer._mode_combo.currentText() == "Filtered"
+    assert viewer.display_settings().mode == "Filtered"
+    panels = viewer.renderer.last_panels
+    assert len(panels) == 1
+    assert panels[0].title.startswith("Filtered --")
+
+
 def test_wiggle_mode_draws_lines_instead_of_an_image(qapp, wait_for_signal):
     viewer, _, _ = _open(qapp, wait_for_signal)
 
@@ -444,6 +456,9 @@ def test_preview_target_reaches_every_service_call_and_is_labelled_as_such(
     viewer.select_coordinate(1.0)
 
     assert "preview" in viewer.windowTitle()
+    # a preview is about the raw data first: opens on the original section
+    assert viewer._mode_combo.currentText() == "Original"
+    assert viewer.renderer.last_panels[0].title.startswith("Original --")
     assert "job" not in viewer.windowTitle().split("--")[1].split("(")[0]
     assert all(target == preview for target in service.targets)
     assert "Preview: Filter type" in viewer._trace_info_label.text()

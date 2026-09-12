@@ -148,6 +148,13 @@ class SeismicViewer(QDialog):
         self._next_button.clicked.connect(lambda: self._step_line(1))
         self._mode_combo = QComboBox(self)
         self._mode_combo.addItems(DISPLAY_MODES)
+        # View Output exists to show the job's result, so it opens on the
+        # filtered section; a Preview is about inspecting the raw data
+        # first, so it opens on the original. Set before connecting: no
+        # renderer is installed yet, so _redraw must not fire here.
+        self._mode_combo.setCurrentText(
+            "Original" if self._context.preview else "Filtered"
+        )
         self._mode_combo.currentIndexChanged.connect(self._redraw)
         self._wiggle_checkbox = QCheckBox("Wiggle", self)
         self._wiggle_checkbox.toggled.connect(self._redraw)
