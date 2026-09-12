@@ -116,6 +116,7 @@ def _dataset() -> SeismicDataset:
         source_path="/data/survey.segy",
         n_inlines=1,
         n_crosslines=1,
+        n_traces=4,
         n_samples=N_SAMPLES,
         sample_rate_ms=4.0,
     )
@@ -168,6 +169,7 @@ def test_run_becomes_enabled_once_service_and_dataset_are_both_set(qapp):
     assert window._run_button.isEnabled() is True
     assert window._name_label.text() == dataset.name
     assert window._inlines_label.text() == str(dataset.n_inlines)
+    assert window._traces_label.text() == str(dataset.n_traces)
     assert window._samples_label.text() == str(dataset.n_samples)
 
 
@@ -515,6 +517,7 @@ def test_failed_reimport_invalidates_the_previously_loaded_dataset(
     assert window._dataset is None
     assert window._run_button.isEnabled() is False
     assert window._name_label.text() == "-"
+    assert window._traces_label.text() == "-"
 
     thread_ref = window._import_thread
     assert thread_ref is not None
@@ -532,6 +535,7 @@ def test_dataset_without_an_id_never_enables_run(qapp):
         source_path="/data/survey.segy",
         n_inlines=1,
         n_crosslines=1,
+        n_traces=4,
         n_samples=N_SAMPLES,
         sample_rate_ms=4.0,
     )
@@ -568,6 +572,7 @@ def test_set_dataset_clamps_a_cutoff_value_above_the_new_nyquist_limit(qapp):
         source_path="/data/low.segy",
         n_inlines=1,
         n_crosslines=1,
+        n_traces=4,
         n_samples=N_SAMPLES,
         sample_rate_ms=200.0,  # nyquist_hz == 1000/200/2 == 2.5
     )

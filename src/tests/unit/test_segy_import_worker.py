@@ -10,6 +10,7 @@ def _fake_dataset() -> SeismicDataset:
         source_path="/data/survey.segy",
         n_inlines=401,
         n_crosslines=720,
+        n_traces=288694,
         n_samples=850,
         sample_rate_ms=4.0,
     )

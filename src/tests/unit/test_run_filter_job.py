@@ -289,6 +289,7 @@ def dataset() -> SeismicDataset:
         source_path="/data/survey.segy",
         n_inlines=401,
         n_crosslines=720,
+        n_traces=288694,
         n_samples=850,
         sample_rate_ms=4.0,  # nyquist_hz == 125.0
     )
@@ -747,7 +748,9 @@ def test_run_filter_job_treats_repeated_cancel_requests_idempotently(dataset):
     )
     job = service.create_filter_job(dataset_id=dataset.id, cutoff_hz=30.0, order=4)
     reader_holder.append(
-        DoubleCancelRequestingTraceReader(traces, service, job.id, cancel_during_chunk=1)
+        DoubleCancelRequestingTraceReader(
+            traces, service, job.id, cancel_during_chunk=1
+        )
     )
 
     # two cancel_job() calls happen back to back while the job is still
@@ -914,7 +917,9 @@ def test_cancel_rejected_after_the_point_of_no_return_has_been_crossed(dataset):
 
 def _build_service_with_blocking_reader_factory(
     dataset: SeismicDataset,
-) -> tuple[FilterJobService, Job, threading.Event, threading.Event, FakeTraceWriter, list[int]]:
+) -> tuple[
+    FilterJobService, Job, threading.Event, threading.Event, FakeTraceWriter, list[int]
+]:
     """Builds a service whose reader_factory blocks on `release` right
     after signalling `entered` -- i.e. strictly *after* run_filter_job()
     has already registered its token and flipped the job to RUNNING, but

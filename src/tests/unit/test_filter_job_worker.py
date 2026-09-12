@@ -101,6 +101,7 @@ def _dataset() -> SeismicDataset:
         source_path="/data/survey.segy",
         n_inlines=1,
         n_crosslines=1,
+        n_traces=4,
         n_samples=N_SAMPLES,
         sample_rate_ms=4.0,
     )

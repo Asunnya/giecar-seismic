@@ -51,6 +51,7 @@ def dataset() -> SeismicDataset:
         source_path="/data/survey.segy",
         n_inlines=401,
         n_crosslines=720,
+        n_traces=288694,
         n_samples=850,
         sample_rate_ms=4.0,  # nyquist_hz == 125.0
     )
@@ -104,9 +105,7 @@ def test_create_filter_job_rejects_order_outside_accepted_range(
         )
 
 
-def test_create_filter_job_does_not_persist_job_on_validation_failure(
-    service, dataset
-):
+def test_create_filter_job_does_not_persist_job_on_validation_failure(service, dataset):
     with pytest.raises(InvalidFilterParametersError):
         service.create_filter_job(dataset_id=dataset.id, cutoff_hz=-10.0, order=4)
 

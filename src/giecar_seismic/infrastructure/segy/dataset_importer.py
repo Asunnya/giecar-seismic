@@ -17,6 +17,7 @@ def import_segy_dataset(source_path: str | Path, name: str) -> SeismicDataset:
     """
     with segyio.open(source_path, mode="r", ignore_geometry=True) as segy:
         n_samples = len(segy.samples)
+        n_traces = segy.tracecount
         sample_rate_ms = float(segyio.tools.dt(segy)) / 1000
 
         inline_values = np.asarray(segy.attributes(segyio.TraceField.INLINE_3D)[:])
@@ -32,6 +33,7 @@ def import_segy_dataset(source_path: str | Path, name: str) -> SeismicDataset:
         source_path=str(source_path),
         n_inlines=n_inlines,
         n_crosslines=n_crosslines,
+        n_traces=n_traces,
         n_samples=n_samples,
         sample_rate_ms=sample_rate_ms,
     )

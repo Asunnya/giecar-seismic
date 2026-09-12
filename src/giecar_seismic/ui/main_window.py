@@ -112,12 +112,14 @@ class MainWindow(QMainWindow):
         self._name_label = QLabel("-", group)
         self._inlines_label = QLabel("-", group)
         self._crosslines_label = QLabel("-", group)
+        self._traces_label = QLabel("-", group)
         self._samples_label = QLabel("-", group)
         self._sample_rate_label = QLabel("-", group)
         self._nyquist_label = QLabel("-", group)
         form.addRow("Name:", self._name_label)
         form.addRow("Inlines:", self._inlines_label)
         form.addRow("Crosslines:", self._crosslines_label)
+        form.addRow("Traces:", self._traces_label)
         form.addRow("Samples:", self._samples_label)
         form.addRow("Sample rate:", self._sample_rate_label)
         form.addRow("Nyquist:", self._nyquist_label)
@@ -238,9 +240,9 @@ class MainWindow(QMainWindow):
         self._status_label.setText("Dataset loaded")
 
     def _on_dataset_import_failed(self, message: str) -> None:
-        # The dataset (if any) from a previous successful import is left
-        # untouched -- a failed import must never leave a partially
-        # updated or otherwise invalid dataset in place.
+        # Nothing to roll back: _start_dataset_import() already invalidated
+        # the previous dataset and cleared its labels, so a failed import
+        # leaves no dataset (None) rather than a stale or partial one.
         self._status_label.setText(f"Failed to load dataset: {message}")
 
     def _on_import_thread_finished(self) -> None:
@@ -253,6 +255,7 @@ class MainWindow(QMainWindow):
             self._name_label,
             self._inlines_label,
             self._crosslines_label,
+            self._traces_label,
             self._samples_label,
             self._sample_rate_label,
             self._nyquist_label,
@@ -264,6 +267,7 @@ class MainWindow(QMainWindow):
         self._name_label.setText(dataset.name)
         self._inlines_label.setText(str(dataset.n_inlines))
         self._crosslines_label.setText(str(dataset.n_crosslines))
+        self._traces_label.setText(str(dataset.n_traces))
         self._samples_label.setText(str(dataset.n_samples))
         self._sample_rate_label.setText(f"{dataset.sample_rate_ms} ms")
         self._nyquist_label.setText(f"{dataset.nyquist_hz:.2f} Hz")
