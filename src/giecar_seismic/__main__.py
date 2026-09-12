@@ -1,10 +1,12 @@
 import sys
 from pathlib import Path
 
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QWidget
 
 from giecar_seismic.application.dataset_import import ImportDatasetUseCase
 from giecar_seismic.application.filter_jobs import FilterJobService
+from giecar_seismic.application.geometry_index import BuildGeometryIndexUseCase
+from giecar_seismic.application.seismic_viewer import SeismicViewerService
 from giecar_seismic.infrastructure.database.engine import (
     create_schema,
     create_sqlite_engine,
@@ -12,12 +14,18 @@ from giecar_seismic.infrastructure.database.engine import (
 )
 from giecar_seismic.infrastructure.database.repositories import (
     SqlAlchemyDatasetRepository,
+    SqlAlchemyGeometryRepository,
     SqlAlchemyJobRepository,
 )
 from giecar_seismic.infrastructure.segy.dataset_importer import import_segy_dataset
-from giecar_seismic.infrastructure.segy.reader import open_dataset_reader
+from giecar_seismic.infrastructure.segy.reader import (
+    iter_trace_header_batches,
+    open_dataset_reader,
+)
+from giecar_seismic.infrastructure.storage.hdf5_reader import open_job_output_reader
 from giecar_seismic.infrastructure.storage.hdf5_writer import make_hdf5_writer_factory
 from giecar_seismic.ui.main_window import MainWindow
+from giecar_seismic.ui.seismic_viewer import SeismicViewer
 
 # Plain defaults for now -- a settings mechanism is out of scope until
 # there's more than one thing to configure.
@@ -48,8 +56,28 @@ def main() -> int:
         writer_factory=make_hdf5_writer_factory(DEFAULT_OUTPUTS_DIR),
     )
 
+    # Viewer: geometry index (built lazily, in bounded batches, on first
+    # open) + selective SEG-Y/HDF5 readers -- the same physical index
+    # addresses both, since the pipeline preserves trace order.
+    geometry = SqlAlchemyGeometryRepository(session_factory)
+    build_geometry_index = BuildGeometryIndexUseCase(
+        iter_trace_header_batches, geometry
+    )
+    viewer_service = SeismicViewerService(
+        datasets=datasets,
+        jobs=jobs,
+        geometry=geometry,
+        original_reader_factory=open_dataset_reader,
+        filtered_reader_factory=open_job_output_reader,
+    )
+
+    def open_viewer(job_id: int, parent: QWidget) -> QWidget:
+        return SeismicViewer(viewer_service, build_geometry_index, job_id, parent)
+
     app = QApplication(sys.argv)
-    window = MainWindow(service=service, dataset_importer=import_dataset)
+    window = MainWindow(
+        service=service, dataset_importer=import_dataset, open_viewer=open_viewer
+    )
     window.show()
     return app.exec_()
 

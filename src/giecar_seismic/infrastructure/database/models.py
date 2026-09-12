@@ -1,6 +1,14 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import (
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -55,3 +63,28 @@ class JobModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class TraceGeometryModel(Base):
+    """One row per physical trace: (dataset, inline, crossline) -> index.
+
+    Kept in SQLite rather than in a Python dict precisely so the viewer
+    can resolve a line's traces without ever holding the survey's whole
+    geometry in memory. The two composite indexes serve the viewer's two
+    queries: "all traces of inline N" and "all traces of crossline N".
+    """
+
+    __tablename__ = "trace_geometry"
+    __table_args__ = (
+        Index("ix_trace_geometry_dataset_inline", "dataset_id", "inline_number"),
+        Index("ix_trace_geometry_dataset_crossline", "dataset_id", "crossline_number"),
+        UniqueConstraint("dataset_id", "trace_index", name="uq_trace_geometry_trace"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    dataset_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("datasets.id"), nullable=False
+    )
+    trace_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    inline_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    crossline_number: Mapped[int] = mapped_column(Integer, nullable=False)

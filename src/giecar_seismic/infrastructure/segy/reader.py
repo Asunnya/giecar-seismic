@@ -1,3 +1,4 @@
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from types import TracebackType
 from typing import Self
@@ -6,6 +7,7 @@ import numpy as np
 import segyio
 
 from giecar_seismic.domain.dataset import SeismicDataset
+from giecar_seismic.domain.geometry import TraceGeometry
 
 
 class SegyTraceReader:
@@ -36,6 +38,19 @@ class SegyTraceReader:
             chunk[row_index] = self._segy.trace[trace_index]
         return chunk
 
+    def read_traces(self, trace_indices: Sequence[int]) -> np.ndarray:
+        """Read an arbitrary, small collection of physical traces, in the
+        order requested. Memory is proportional to len(trace_indices) --
+        the viewer uses this for one section at a time.
+        """
+        for index in trace_indices:
+            if not 0 <= index < self.trace_count:
+                raise ValueError(f"trace index {index} outside [0, {self.trace_count})")
+        out = np.empty((len(trace_indices), self._sample_count), dtype=np.float32)
+        for row, index in enumerate(trace_indices):
+            out[row] = self._segy.trace[index]
+        return out
+
     def close(self) -> None:
         self._segy.close()
 
@@ -57,3 +72,31 @@ def open_dataset_reader(dataset: SeismicDataset) -> SegyTraceReader:
     dataset.n_traces before processing.
     """
     return SegyTraceReader(dataset.source_path)
+
+
+def iter_trace_header_batches(
+    source_path: str, batch_size: int
+) -> Iterator[list[TraceGeometry]]:
+    """TraceHeaderBatchReader for BuildGeometryIndexUseCase.
+
+    Reads INLINE_3D/CROSSLINE_3D for `batch_size` traces at a time via
+    segyio attribute slices -- each batch is a small array, and nothing
+    accumulates across batches. (Unlike import_segy_dataset, which still
+    pulls the full header columns once to count distinct lines.)
+    """
+    with segyio.open(source_path, mode="r", ignore_geometry=True) as segy:
+        total = segy.tracecount
+        inlines = segy.attributes(segyio.TraceField.INLINE_3D)
+        crosslines = segy.attributes(segyio.TraceField.CROSSLINE_3D)
+        for start in range(0, total, batch_size):
+            stop = min(start + batch_size, total)
+            batch_inlines = np.asarray(inlines[start:stop])
+            batch_crosslines = np.asarray(crosslines[start:stop])
+            yield [
+                TraceGeometry(
+                    trace_index=start + offset,
+                    inline=int(batch_inlines[offset]),
+                    crossline=int(batch_crosslines[offset]),
+                )
+                for offset in range(stop - start)
+            ]

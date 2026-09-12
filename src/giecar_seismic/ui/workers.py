@@ -101,3 +101,33 @@ class SegyImportWorker(QObject):
             return
 
         self.succeeded.emit(dataset)
+
+
+class JobHistoryWorker(QObject):
+    """Runs FilterJobService.list_jobs(dataset_id, status) off the GUI
+    thread and emits the resulting list of domain Jobs -- small metadata
+    objects only. Never touches a QWidget."""
+
+    succeeded = pyqtSignal(object)  # list[Job]
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        service: FilterJobService,
+        dataset_id: int | None,
+        status: JobStatus | None,
+    ) -> None:
+        super().__init__()
+        self._service = service
+        self._dataset_id = dataset_id
+        self._status = status
+
+    def run(self) -> None:
+        try:
+            jobs = self._service.list_jobs(
+                dataset_id=self._dataset_id, status=self._status
+            )
+        except Exception as exc:  # noqa: BLE001 -- any failure must reach the GUI via a signal
+            self.failed.emit(str(exc))
+            return
+        self.succeeded.emit(jobs)

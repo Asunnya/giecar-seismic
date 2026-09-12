@@ -9,7 +9,7 @@ from giecar_seismic.application.filter_jobs import FilterJobService
 from giecar_seismic.domain.dataset import SeismicDataset
 from giecar_seismic.domain.job import Job, JobStatus
 from giecar_seismic.ui import main_window as main_window_module
-from giecar_seismic.ui.main_window import MainWindow
+from giecar_seismic.ui.main_window import JOBS_TABLE_HEADERS, STATUS_COLUMN, MainWindow
 
 N_SAMPLES = 64  # large enough for sosfiltfilt's padlen at order=4
 
@@ -126,6 +126,15 @@ def _dataset() -> SeismicDataset:
     )
 
 
+def _wait_settled(window, wait_for_signal, signal) -> None:
+    """Wait for `signal`, then also drain any history query MainWindow
+    started meanwhile (startup load or the post-terminal reconcile), so no
+    QThread outlives the test."""
+    wait_for_signal(signal)
+    while window._history_thread is not None:
+        wait_for_signal(window._history_thread.finished)
+
+
 def _build_service(dataset: SeismicDataset, reader, writer, chunk_size: int = 1):
     return FilterJobService(
         datasets=FakeDatasetRepository([dataset]),
@@ -149,7 +158,9 @@ def test_construction_builds_the_expected_sections(qapp):
     assert window._run_button.text() == "Run Filter"
     assert window._cancel_button.text() == "Cancel"
     assert window._status_label.text() == "Idle"
-    assert window._jobs_table.columnCount() == 4
+    assert window._jobs_table.columnCount() == len(JOBS_TABLE_HEADERS)
+    assert window._open_output_button.text() == "Open output folder"
+    assert window._open_output_button.isEnabled() is False
 
 
 def test_initial_state_disables_run_and_cancel_with_zero_progress(qapp):
@@ -210,7 +221,7 @@ def test_starting_a_job_disables_run_and_enables_cancel_immediately(
     # destroyed while still running crashes the process. Waiting on
     # thread.finished (not just the worker's terminal signal) is what
     # actually guarantees the OS thread is done.
-    wait_for_signal(thread_ref.finished)
+    _wait_settled(window, wait_for_signal, thread_ref.finished)
 
 
 def test_completed_job_restores_controls_and_updates_the_jobs_table(
@@ -227,16 +238,16 @@ def test_completed_job_restores_controls_and_updates_the_jobs_table(
     thread_ref = window._thread
     assert thread_ref is not None
 
-    wait_for_signal(thread_ref.finished)
+    _wait_settled(window, wait_for_signal, thread_ref.finished)
 
     assert window._run_button.isEnabled() is True
     assert window._cancel_button.isEnabled() is False
     assert window._progress_bar.value() == 100
-    assert window._status_label.text() == "Completed"
+    assert window._status_label.text() == "Completed: /fake/output.h5"
     assert writer.finalized is True
 
     assert window._jobs_table.rowCount() == 1
-    assert window._jobs_table.item(0, 3).text() == JobStatus.COMPLETED.name
+    assert window._jobs_table.item(0, STATUS_COLUMN).text() == JobStatus.COMPLETED.name
 
     # cleanup: the QThread/worker references must be dropped, but only
     # after the thread actually finished -- never while it was running.
@@ -259,12 +270,12 @@ def test_failed_job_reaches_the_ui_through_a_signal_and_is_not_swallowed(
     thread_ref = window._thread
     assert thread_ref is not None
 
-    wait_for_signal(thread_ref.finished)
+    _wait_settled(window, wait_for_signal, thread_ref.finished)
 
     assert window._status_label.text() == "Failed: disk full"
     assert window._run_button.isEnabled() is True
     assert window._cancel_button.isEnabled() is False
-    assert window._jobs_table.item(0, 3).text() == JobStatus.FAILED.name
+    assert window._jobs_table.item(0, STATUS_COLUMN).text() == JobStatus.FAILED.name
 
 
 def test_cancel_requests_cooperative_cancellation_without_touching_the_thread(
@@ -303,14 +314,14 @@ def test_cancel_requests_cooperative_cancellation_without_touching_the_thread(
     assert thread_ref.isRunning() is True
 
     release.set()
-    wait_for_signal(thread_ref.finished)
+    _wait_settled(window, wait_for_signal, thread_ref.finished)
 
     assert window._thread is None
     assert window._worker is None
     [job] = service.list_jobs()
     assert job.status is JobStatus.CANCELLED
     assert writer.finalized is False
-    assert window._jobs_table.item(0, 3).text() == JobStatus.CANCELLED.name
+    assert window._jobs_table.item(0, STATUS_COLUMN).text() == JobStatus.CANCELLED.name
 
 
 # --- Select SEG-Y -> import worker -> Dataset section --------------------
@@ -347,7 +358,7 @@ def test_selecting_a_file_starts_import_without_running_it_on_the_gui_thread(
     assert entered.wait(timeout=5), "test deadlocked: importer never started running"
 
     release.set()
-    wait_for_signal(thread_ref.finished)
+    _wait_settled(window, wait_for_signal, thread_ref.finished)
 
     assert window._dataset is dataset
     assert window._name_label.text() == dataset.name
@@ -384,7 +395,7 @@ def test_dataset_import_failure_reaches_the_ui_without_a_partial_dataset(
     thread_ref = window._import_thread
     assert thread_ref is not None
 
-    wait_for_signal(thread_ref.finished)
+    _wait_settled(window, wait_for_signal, thread_ref.finished)
 
     assert window._dataset is None
     assert (
@@ -425,7 +436,7 @@ def test_run_button_stays_disabled_while_an_import_is_in_progress(
     release.set()
     thread_ref = window._import_thread
     assert thread_ref is not None
-    wait_for_signal(thread_ref.finished)
+    _wait_settled(window, wait_for_signal, thread_ref.finished)
 
     assert window._run_button.isEnabled() is True
 
@@ -455,7 +466,7 @@ def test_selecting_a_file_again_while_importing_is_ignored(qapp, wait_for_signal
     assert import_calls == ["/data/first.segy"]
 
     release.set()
-    wait_for_signal(first_thread.finished)
+    _wait_settled(window, wait_for_signal, first_thread.finished)
 
 
 def test_close_event_is_rejected_while_import_thread_is_running_and_accepted_when_idle(
@@ -488,7 +499,7 @@ def test_close_event_is_rejected_while_import_thread_is_running_and_accepted_whe
     assert thread_ref.isRunning() is True
 
     release.set()
-    wait_for_signal(thread_ref.finished)
+    _wait_settled(window, wait_for_signal, thread_ref.finished)
 
     idle_event = QCloseEvent()
     window.closeEvent(idle_event)
@@ -525,7 +536,7 @@ def test_failed_reimport_invalidates_the_previously_loaded_dataset(
 
     thread_ref = window._import_thread
     assert thread_ref is not None
-    wait_for_signal(thread_ref.finished)
+    _wait_settled(window, wait_for_signal, thread_ref.finished)
 
     assert window._dataset is None
     assert window._run_button.isEnabled() is False
@@ -616,7 +627,7 @@ def test_select_segy_disabled_and_ignored_while_a_filter_job_is_running(
     release.set()
     thread_ref = window._thread
     assert thread_ref is not None
-    wait_for_signal(thread_ref.finished)
+    _wait_settled(window, wait_for_signal, thread_ref.finished)
 
     assert window._select_segy_button.isEnabled() is True
 
@@ -662,10 +673,128 @@ def test_successful_import_delivers_a_persisted_dataset_with_id_to_the_ui(
     window._select_segy_button.click()
     thread_ref = window._import_thread
     assert thread_ref is not None
-    wait_for_signal(thread_ref.finished)
+    _wait_settled(window, wait_for_signal, thread_ref.finished)
 
     assert window._dataset is persisted
     assert window._dataset.id == 42
     assert window._traces_label.text() == str(persisted.n_traces)
     # the importer ran off the GUI thread (this test's thread)
     assert importer_thread_names != [threading.current_thread().name]
+
+
+# --- Output location: visible in the table/status and openable ------------
+
+
+def _completed_window(qapp, wait_for_signal, output_path="/out/job-1.h5"):
+    dataset = _dataset()
+    traces = np.zeros((4, N_SAMPLES), dtype=np.float32)
+    writer = FakeTraceWriter()
+    writer.output_path = output_path
+    service = _build_service(dataset, FakeTraceReader(traces), writer, chunk_size=2)
+    window = MainWindow(service=service)
+    window.set_dataset(dataset)
+    window._run_button.click()
+    thread_ref = window._thread
+    assert thread_ref is not None
+    _wait_settled(window, wait_for_signal, thread_ref.finished)
+    return window
+
+
+def test_completed_job_shows_its_output_path_in_the_table_and_status(
+    qapp, wait_for_signal
+):
+    window = _completed_window(qapp, wait_for_signal, "/out/job-1.h5")
+
+    assert window._table_jobs[0].output_path == "/out/job-1.h5"
+    assert "/out/job-1.h5" in window._status_label.text()
+
+
+def test_job_row_shows_dash_while_there_is_no_finished_time_yet(qapp):
+    from giecar_seismic.ui.main_window import FINISHED_AT_COLUMN
+
+    window = MainWindow()
+    window._insert_job_row(0, Job(dataset_id=1, cutoff_hz=30.0, order=4, id=7))
+
+    assert window._jobs_table.item(0, FINISHED_AT_COLUMN).text() == "-"
+
+
+def test_open_output_button_enables_only_for_a_selected_job_with_an_output(
+    qapp, wait_for_signal
+):
+    window = _completed_window(qapp, wait_for_signal, "/out/job-1.h5")
+    window._insert_job_row(
+        1, Job(dataset_id=1, cutoff_hz=30.0, order=4, id=99)
+    )  # no output
+
+    assert window._open_output_button.isEnabled() is False
+    window._jobs_table.selectRow(0)
+    assert window._open_output_button.isEnabled() is True
+    window._jobs_table.selectRow(1)
+    assert window._open_output_button.isEnabled() is False
+
+
+def test_open_output_button_reveals_the_selected_jobs_output_folder(
+    qapp, wait_for_signal, monkeypatch
+):
+    window = _completed_window(qapp, wait_for_signal, "/out/job-1.h5")
+    revealed: list[str] = []
+    monkeypatch.setattr(window, "_reveal_in_file_manager", revealed.append)
+
+    window._jobs_table.selectRow(0)
+    window._open_output_button.click()
+
+    assert revealed == ["/out/job-1.h5"]
+
+
+def test_main_window_still_builds_no_output_paths_itself():
+    # the UI only displays/opens paths the service already put on the Job.
+    source = inspect.getsource(main_window_module)
+    assert ".h5" not in source
+
+
+# --- View Output -> seismic viewer -------------------------------------------
+
+
+def test_view_output_button_enables_only_for_a_selected_completed_job(
+    qapp, wait_for_signal
+):
+    from PyQt5.QtWidgets import QWidget
+
+    opened: list[int] = []
+    window = _completed_window(qapp, wait_for_signal, "/out/job-1.h5")
+
+    def fake_open_viewer(job_id: int, parent: QWidget) -> QWidget:
+        opened.append(job_id)
+        return QWidget(parent)
+
+    window._open_viewer = fake_open_viewer
+    window._insert_job_row(
+        1,
+        Job(
+            dataset_id=1,
+            cutoff_hz=30.0,
+            order=4,
+            id=2,
+            status=JobStatus.CANCELLED,
+            output_path="/out/job-2.h5",
+        ),
+    )
+
+    assert window._view_output_button.isEnabled() is False  # nothing selected
+    window._jobs_table.selectRow(1)  # CANCELLED: not viewable (even with output)
+    assert window._view_output_button.isEnabled() is False
+    window._jobs_table.selectRow(0)  # COMPLETED
+    assert window._view_output_button.isEnabled() is True
+
+    window._view_output_button.click()
+
+    assert opened == [1]
+
+
+def test_view_output_is_disabled_when_no_viewer_is_composed(qapp, wait_for_signal):
+    window = _completed_window(qapp, wait_for_signal, "/out/job-1.h5")
+    assert window._open_viewer is None
+
+    window._jobs_table.selectRow(0)
+
+    assert window._view_output_button.isEnabled() is False

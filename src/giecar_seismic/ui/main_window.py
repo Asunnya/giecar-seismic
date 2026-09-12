@@ -1,8 +1,11 @@
+from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
-from PyQt5.QtCore import QThread
-from PyQt5.QtGui import QCloseEvent
+from PyQt5.QtCore import QThread, QTimer, QUrl, pyqtSignal
+from PyQt5.QtGui import QCloseEvent, QDesktopServices
 from PyQt5.QtWidgets import (
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -25,10 +28,46 @@ from giecar_seismic.application.filter_jobs import (
     FilterJobService,
 )
 from giecar_seismic.domain.dataset import SeismicDataset
-from giecar_seismic.domain.job import Job
-from giecar_seismic.ui.workers import DatasetImporter, FilterJobWorker, SegyImportWorker
+from giecar_seismic.domain.job import Job, JobStatus
+from giecar_seismic.ui.workers import (
+    DatasetImporter,
+    FilterJobWorker,
+    JobHistoryWorker,
+    SegyImportWorker,
+)
 
-JOBS_TABLE_HEADERS = ["id", "cutoff (Hz)", "order", "status"]
+JOBS_TABLE_HEADERS = [
+    "ID",
+    "Dataset",
+    "Cutoff (Hz)",
+    "Order",
+    "Status",
+    "Progress",
+    "Created at",
+    "Finished at",
+]
+DATASET_COLUMN = JOBS_TABLE_HEADERS.index("Dataset")
+STATUS_COLUMN = JOBS_TABLE_HEADERS.index("Status")
+PROGRESS_COLUMN = JOBS_TABLE_HEADERS.index("Progress")
+CREATED_AT_COLUMN = JOBS_TABLE_HEADERS.index("Created at")
+FINISHED_AT_COLUMN = JOBS_TABLE_HEADERS.index("Finished at")
+ALL_DATASETS = "All datasets"
+ALL_STATUSES = "All statuses"
+
+
+def format_datetime(value: datetime | None) -> str:
+    """Stable, readable timestamp for the history table. Datetimes are naive
+    local time throughout the domain; no timezone is invented here."""
+    return value.strftime("%Y-%m-%d %H:%M:%S") if value is not None else "-"
+
+
+def format_progress(progress: float) -> str:
+    return f"{progress:g}%"
+
+
+# Opens the seismic viewer for a job id; composed in __main__ so this
+# window never imports the viewer's service/infrastructure wiring.
+ViewerOpener = Callable[[int, QWidget], QWidget]
 
 # Keeps the cutoff spinbox strictly below Nyquist (0 < cutoff_hz <
 # nyquist_hz, per FilterJobService.create_filter_job) by one step.
@@ -36,6 +75,10 @@ CUTOFF_EPSILON_HZ = 0.01
 
 
 class MainWindow(QMainWindow):
+    # Emitted on the GUI thread once a history query has finished -- table
+    # rebuilt from the list_jobs() result and its QThread already gone.
+    history_refreshed = pyqtSignal()
+
     """First vertical slice of the desktop UI: Dataset -> Filter ->
     Processing -> Jobs, wired to run a single filter job on a QThread.
 
@@ -64,11 +107,14 @@ class MainWindow(QMainWindow):
         self,
         service: FilterJobService | None = None,
         dataset_importer: DatasetImporter | None = None,
+        open_viewer: ViewerOpener | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._service = service
         self._dataset_importer = dataset_importer
+        self._open_viewer = open_viewer
+        self._viewer: QWidget | None = None
         self._dataset: SeismicDataset | None = None
         self._current_job_id: int | None = None
 
@@ -84,9 +130,25 @@ class MainWindow(QMainWindow):
         self._import_thread: QThread | None = None
         self._import_worker: SegyImportWorker | None = None
 
+        # History query, same pattern. The visible rows are a display of
+        # the last list_jobs() result (`_table_jobs`, row-aligned); SQLite
+        # is the source of truth -- a terminal job state triggers a
+        # refresh to reconcile with what was persisted.
+        self._history_thread: QThread | None = None
+        self._history_worker: JobHistoryWorker | None = None
+        self._table_jobs: list[Job] = []
+        self._known_dataset_ids: set[int] = set()
+
         self.setWindowTitle("GIECAR Seismic Filter")
         self._build_ui()
         self._refresh_controls()
+        self._history_loaded_once = False
+        self._history_result_pending = False
+        if self._service is not None:
+            # First load once the event loop is running -- never a
+            # synchronous query inside widget construction. A no-op if
+            # something already refreshed the history before it fires.
+            QTimer.singleShot(0, self._initial_history_load)
 
     # -- UI construction -----------------------------------------------
 
@@ -172,10 +234,50 @@ class MainWindow(QMainWindow):
         group = QGroupBox("Jobs", self)
         layout = QVBoxLayout(group)
 
+        filters = QHBoxLayout()
+        self._dataset_filter = QComboBox(group)
+        self._dataset_filter.addItem(ALL_DATASETS)
+        self._dataset_filter.currentIndexChanged.connect(
+            self._on_history_filter_changed
+        )
+        self._status_filter = QComboBox(group)
+        self._status_filter.addItem(ALL_STATUSES)
+        self._status_filter.addItems([status.name for status in JobStatus])
+        self._status_filter.currentIndexChanged.connect(self._on_history_filter_changed)
+        self._refresh_button = QPushButton("Refresh", group)
+        self._refresh_button.clicked.connect(self.refresh_history)
+        self._history_status_label = QLabel("", group)
+        for widget in (
+            QLabel("Dataset:", group),
+            self._dataset_filter,
+            QLabel("Status:", group),
+            self._status_filter,
+            self._refresh_button,
+            self._history_status_label,
+        ):
+            filters.addWidget(widget)
+        filters.addStretch(1)
+        layout.addLayout(filters)
+
         self._jobs_table = QTableWidget(0, len(JOBS_TABLE_HEADERS), group)
         self._jobs_table.setHorizontalHeaderLabels(JOBS_TABLE_HEADERS)
         self._jobs_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._jobs_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._jobs_table.itemSelectionChanged.connect(self._refresh_output_buttons)
         layout.addWidget(self._jobs_table)
+
+        # Reveals the selected job's output in the OS file manager. The
+        # path itself always comes from the Job (set by the service); the
+        # UI never builds output locations.
+        self._open_output_button = QPushButton("Open output folder", group)
+        self._open_output_button.setEnabled(False)
+        self._open_output_button.clicked.connect(self._on_open_output_clicked)
+        layout.addWidget(self._open_output_button)
+
+        self._view_output_button = QPushButton("View Output", group)
+        self._view_output_button.setEnabled(False)
+        self._view_output_button.clicked.connect(self._on_view_output_clicked)
+        layout.addWidget(self._view_output_button)
 
         return group
 
@@ -325,7 +427,7 @@ class MainWindow(QMainWindow):
             cutoff_hz=self._cutoff_spinbox.value(),
             order=self._order_spinbox.value(),
         )
-        self._add_job_row(job)
+        self._insert_job_row(0, job)  # newest first, like the persisted history
         assert job.id is not None
         self._current_job_id = job.id
 
@@ -387,7 +489,7 @@ class MainWindow(QMainWindow):
 
     def _on_job_completed(self, job: Job) -> None:
         self._progress_bar.setValue(100)
-        self._finish_job("Completed", job)
+        self._finish_job(f"Completed: {job.output_path}", job)
 
     def _on_job_cancelled(self, job: Job) -> None:
         self._finish_job("Cancelled", job)
@@ -407,6 +509,8 @@ class MainWindow(QMainWindow):
         if resolved_job is not None:
             self._update_job_row(resolved_job)
         self._current_job_id = None
+        # Reconcile the screen with what was actually persisted.
+        self.refresh_history()
 
     def _on_thread_finished(self) -> None:
         # deleteLater() for both the worker and the thread was already
@@ -437,7 +541,11 @@ class MainWindow(QMainWindow):
         """
         if event is None:
             return
-        if self._thread is None and self._import_thread is None:
+        if (
+            self._thread is None
+            and self._import_thread is None
+            and self._history_thread is None
+        ):
             event.accept()
             return
 
@@ -452,21 +560,168 @@ class MainWindow(QMainWindow):
         )
         event.ignore()
 
-    # -- Jobs table -------------------------------------------------------
+    # -- Jobs history ------------------------------------------------------
 
-    def _add_job_row(self, job: Job) -> None:
-        row = self._jobs_table.rowCount()
+    def _selected_history_filters(self) -> tuple[int | None, JobStatus | None]:
+        dataset_text = self._dataset_filter.currentText()
+        dataset_id = (
+            None
+            if dataset_text == ALL_DATASETS
+            else int(dataset_text.removeprefix("Dataset #"))
+        )
+        status_text = self._status_filter.currentText()
+        status = None if status_text == ALL_STATUSES else JobStatus[status_text]
+        return dataset_id, status
+
+    def _on_history_filter_changed(self, _index: int) -> None:
+        self.refresh_history()
+
+    def _set_history_controls_enabled(self, enabled: bool) -> None:
+        for widget in (self._dataset_filter, self._status_filter, self._refresh_button):
+            widget.setEnabled(enabled)
+
+    def _initial_history_load(self) -> None:
+        if not self._history_loaded_once:
+            self.refresh_history()
+
+    def refresh_history(self) -> None:
+        """Query list_jobs(dataset_id, status) off the GUI thread and rebuild
+        the table from the result. One query at a time: filters and Refresh
+        are disabled while it runs."""
+        if self._service is None or self._history_thread is not None:
+            return
+        dataset_id, status = self._selected_history_filters()
+        thread = QThread(self)
+        worker = JobHistoryWorker(self._service, dataset_id, status)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_history_loaded)
+        worker.failed.connect(self._on_history_failed)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.succeeded.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_history_thread_finished)
+        self._history_thread = thread
+        self._history_worker = worker
+        self._history_loaded_once = True
+        self._set_history_controls_enabled(False)
+        thread.start()
+
+    def _on_history_loaded(self, jobs: list[Job]) -> None:
+        # Newest first: created_at, then id as a deterministic tie-break.
+        ordered = sorted(jobs, key=lambda j: (j.created_at, j.id or 0), reverse=True)
+        self._known_dataset_ids.update(j.dataset_id for j in ordered)
+        self._rebuild_dataset_filter()
+        self._jobs_table.setRowCount(0)
+        self._table_jobs = []
+        for job in ordered:
+            self._insert_job_row(self._jobs_table.rowCount(), job)
+        self._history_status_label.setText(f"{len(ordered)} jobs")
+        self._refresh_output_buttons()
+        self._history_result_pending = True
+
+    def _on_history_failed(self, message: str) -> None:
+        self._history_status_label.setText(f"History unavailable: {message}")
+
+    def _on_history_thread_finished(self) -> None:
+        self._history_thread = None
+        self._history_worker = None
+        self._set_history_controls_enabled(True)
+        if self._history_result_pending:
+            self._history_result_pending = False
+            self.history_refreshed.emit()
+
+    def _rebuild_dataset_filter(self) -> None:
+        wanted = [ALL_DATASETS] + [
+            f"Dataset #{i}" for i in sorted(self._known_dataset_ids)
+        ]
+        current = self._dataset_filter.currentText()
+        existing = [
+            self._dataset_filter.itemText(i)
+            for i in range(self._dataset_filter.count())
+        ]
+        if existing == wanted:
+            return
+        self._dataset_filter.blockSignals(True)
+        self._dataset_filter.clear()
+        self._dataset_filter.addItems(wanted)
+        self._dataset_filter.setCurrentText(
+            current if current in wanted else ALL_DATASETS
+        )
+        self._dataset_filter.blockSignals(False)
+
+    # -- Jobs table rows --------------------------------------------------------
+
+    def _insert_job_row(self, row: int, job: Job) -> None:
         self._jobs_table.insertRow(row)
+        self._table_jobs.insert(row, job)
         self._set_job_row(row, job)
 
     def _update_job_row(self, job: Job) -> None:
-        for row in range(self._jobs_table.rowCount()):
-            item = self._jobs_table.item(row, 0)
-            if item is not None and item.text() == str(job.id):
+        for row, existing in enumerate(self._table_jobs):
+            if existing.id == job.id:
+                self._table_jobs[row] = job
                 self._set_job_row(row, job)
                 return
 
     def _set_job_row(self, row: int, job: Job) -> None:
-        values = [str(job.id), str(job.cutoff_hz), str(job.order), job.status.name]
+        values = [
+            str(job.id),
+            f"Dataset #{job.dataset_id}",
+            str(job.cutoff_hz),
+            str(job.order),
+            job.status.name,
+            format_progress(job.progress),
+            format_datetime(job.created_at),
+            format_datetime(job.finished_at),
+        ]
         for column, value in enumerate(values):
             self._jobs_table.setItem(row, column, QTableWidgetItem(value))
+        self._refresh_output_buttons()
+
+    def _selected_job(self) -> Job | None:
+        rows = {index.row() for index in self._jobs_table.selectedIndexes()}
+        if len(rows) != 1:
+            return None
+        row = rows.pop()
+        return self._table_jobs[row] if row < len(self._table_jobs) else None
+
+    def _selected_output_path(self) -> str | None:
+        job = self._selected_job()
+        return job.output_path if job is not None else None
+
+    def _refresh_output_buttons(self) -> None:
+        self._open_output_button.setEnabled(self._selected_output_path() is not None)
+        self._view_output_button.setEnabled(
+            self._selected_viewable_job_id() is not None
+        )
+
+    def _selected_viewable_job_id(self) -> int | None:
+        # Only COMPLETED jobs (a finalized HDF5) are viewable -- including
+        # ones loaded from history: the viewer resolves the job's own
+        # dataset by job.dataset_id, never this window's current dataset.
+        job = self._selected_job()
+        if self._open_viewer is None or job is None or job.output_path is None:
+            return None
+        if job.status is not JobStatus.COMPLETED:
+            return None
+        return job.id
+
+    def _on_view_output_clicked(self) -> None:
+        job_id = self._selected_viewable_job_id()
+        if job_id is None or self._open_viewer is None:
+            return
+        self._viewer = self._open_viewer(job_id, self)
+        self._viewer.show()
+
+    def _on_open_output_clicked(self) -> None:
+        path = self._selected_output_path()
+        if path is not None:
+            self._reveal_in_file_manager(path)
+
+    def _reveal_in_file_manager(self, path: str) -> None:
+        # Opens the containing folder with the platform's file manager;
+        # extracted so tests can observe the call without launching one.
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).parent)))

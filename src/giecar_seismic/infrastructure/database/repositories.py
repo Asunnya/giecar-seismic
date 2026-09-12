@@ -1,9 +1,14 @@
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from giecar_seismic.domain.dataset import SeismicDataset
+from giecar_seismic.domain.geometry import TraceGeometry
 from giecar_seismic.domain.job import Job, JobStatus
-from giecar_seismic.infrastructure.database.models import DatasetModel, JobModel
+from giecar_seismic.infrastructure.database.models import (
+    DatasetModel,
+    JobModel,
+    TraceGeometryModel,
+)
 
 # Every repository method follows the same session lifecycle:
 #
@@ -141,3 +146,110 @@ class SqlAlchemyJobRepository:
         statement = statement.order_by(JobModel.id)
         with self._session_factory() as session:
             return [_job_to_domain(model) for model in session.scalars(statement)]
+
+
+def _geometry_to_domain(model: TraceGeometryModel) -> TraceGeometry:
+    return TraceGeometry(
+        trace_index=model.trace_index,
+        inline=model.inline_number,
+        crossline=model.crossline_number,
+    )
+
+
+class SqlAlchemyGeometryRepository:
+    """Implements both application ports: GeometryIndexWriter (build) and
+    GeometryRepository (viewer queries). Every query returns only one
+    line's worth of rows or a distinct list of line numbers -- never the
+    whole survey.
+    """
+
+    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+        self._session_factory = session_factory
+
+    # -- write side (BuildGeometryIndexUseCase) ---------------------------
+
+    def count(self, dataset_id: int) -> int:
+        statement = (
+            select(func.count())
+            .select_from(TraceGeometryModel)
+            .where(TraceGeometryModel.dataset_id == dataset_id)
+        )
+        with self._session_factory() as session:
+            return int(session.execute(statement).scalar_one())
+
+    def add_batch(self, dataset_id: int, batch: list[TraceGeometry]) -> None:
+        with self._session_factory() as session, session.begin():
+            session.add_all(
+                TraceGeometryModel(
+                    dataset_id=dataset_id,
+                    trace_index=g.trace_index,
+                    inline_number=g.inline,
+                    crossline_number=g.crossline,
+                )
+                for g in batch
+            )
+
+    def delete_for_dataset(self, dataset_id: int) -> None:
+        with self._session_factory() as session, session.begin():
+            session.execute(
+                delete(TraceGeometryModel).where(
+                    TraceGeometryModel.dataset_id == dataset_id
+                )
+            )
+
+    # -- read side (SeismicViewerService) ---------------------------------
+
+    def traces_for_inline(self, dataset_id: int, inline: int) -> list[TraceGeometry]:
+        statement = (
+            select(TraceGeometryModel)
+            .where(
+                TraceGeometryModel.dataset_id == dataset_id,
+                TraceGeometryModel.inline_number == inline,
+            )
+            .order_by(TraceGeometryModel.crossline_number)
+        )
+        with self._session_factory() as session:
+            return [_geometry_to_domain(m) for m in session.scalars(statement)]
+
+    def traces_for_crossline(
+        self, dataset_id: int, crossline: int
+    ) -> list[TraceGeometry]:
+        statement = (
+            select(TraceGeometryModel)
+            .where(
+                TraceGeometryModel.dataset_id == dataset_id,
+                TraceGeometryModel.crossline_number == crossline,
+            )
+            .order_by(TraceGeometryModel.inline_number)
+        )
+        with self._session_factory() as session:
+            return [_geometry_to_domain(m) for m in session.scalars(statement)]
+
+    def inline_numbers(self, dataset_id: int) -> list[int]:
+        statement = (
+            select(TraceGeometryModel.inline_number)
+            .where(TraceGeometryModel.dataset_id == dataset_id)
+            .distinct()
+            .order_by(TraceGeometryModel.inline_number)
+        )
+        with self._session_factory() as session:
+            return [int(v) for v in session.scalars(statement)]
+
+    def crossline_numbers(self, dataset_id: int) -> list[int]:
+        statement = (
+            select(TraceGeometryModel.crossline_number)
+            .where(TraceGeometryModel.dataset_id == dataset_id)
+            .distinct()
+            .order_by(TraceGeometryModel.crossline_number)
+        )
+        with self._session_factory() as session:
+            return [int(v) for v in session.scalars(statement)]
+
+    def get_trace(self, dataset_id: int, trace_index: int) -> TraceGeometry | None:
+        statement = select(TraceGeometryModel).where(
+            TraceGeometryModel.dataset_id == dataset_id,
+            TraceGeometryModel.trace_index == trace_index,
+        )
+        with self._session_factory() as session:
+            model = session.scalars(statement).first()
+            return _geometry_to_domain(model) if model is not None else None
