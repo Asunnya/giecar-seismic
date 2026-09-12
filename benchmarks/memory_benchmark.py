@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import resource
 import statistics
 import sys
 import time
@@ -116,6 +115,70 @@ def peak_rss_to_mb(value: float, *, platform: str = sys.platform) -> float:
     raise ValueError(f"unsupported platform for ru_maxrss conversion: {platform}")
 
 
+def _peak_working_set_bytes_windows() -> int:
+    """Peak working set of this process via ``GetProcessMemoryInfo`` (psapi).
+
+    The working set is Windows' resident-set counterpart, so
+    ``PeakWorkingSetSize`` is the equivalent of ``ru_maxrss`` on POSIX.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessMemoryCounters(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    # ``WinDLL`` only exists in typeshed under sys.platform == "win32".
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    psapi.GetProcessMemoryInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ProcessMemoryCounters),
+        wintypes.DWORD,
+    ]
+    psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+
+    counters = ProcessMemoryCounters()
+    counters.cb = ctypes.sizeof(counters)
+    ok = psapi.GetProcessMemoryInfo(
+        kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+    )
+    if not ok:
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+    return int(counters.PeakWorkingSetSize)
+
+
+def measure_peak_rss_mb(*, platform: str = sys.platform) -> float:
+    """Peak resident memory of this process in MiB, per operating system.
+
+    POSIX reports ``ru_maxrss`` (``resource`` is a POSIX-only stdlib module, so
+    it is imported lazily: importing this module -- e.g. to unit-test the pure
+    helpers -- must work on Windows too); Windows reports the peak working set.
+    """
+    if platform == "win32":
+        return _peak_working_set_bytes_windows() / 1024**2
+    try:
+        import resource
+    except ImportError as exc:
+        raise ValueError(
+            f"peak RSS measurement is not supported on platform {platform!r}"
+        ) from exc
+    return peak_rss_to_mb(
+        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, platform=platform
+    )
+
+
 def read_segy_metadata(source_path: Path) -> SegyMetadata:
     if not source_path.is_file():
         raise FileNotFoundError(
@@ -188,9 +251,7 @@ def naive_filter_to_hdf5(
     output_dtype: np.dtype,
 ) -> None:
     all_traces = reader.read_chunk(0, trace_count)
-    all_filtered = apply_lowpass_filter(
-        all_traces, cutoff_hz, order, sample_rate_ms
-    )
+    all_filtered = apply_lowpass_filter(all_traces, cutoff_hz, order, sample_rate_ms)
     with h5py.File(output_path, "w") as output:
         traces = _create_trace_dataset(
             output,
@@ -294,7 +355,7 @@ def run_benchmark(
     finally:
         reader.close()
     elapsed_seconds = time.perf_counter() - started
-    peak_rss_mb = peak_rss_to_mb(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    peak_rss_mb = measure_peak_rss_mb()
     return BenchmarkResult(
         strategy=strategy,
         trace_count=trace_count,

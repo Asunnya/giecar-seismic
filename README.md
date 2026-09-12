@@ -327,8 +327,9 @@ aumentar o número de processos pode ainda causar disputa pelos mesmos núcleos.
 A aplicação usa **streaming**: lê 256 traços, aplica o filtro e persiste o chunk
 antes de seguir. O [notebook de benchmark](notebooks/02_memory_benchmark.ipynb)
 compara esse pipeline com uma referência ingênua que mantém todo o prefixo e seu
-resultado na memória. Cada medição roda em um processo isolado e usa o pico RSS
-observado pelo Linux.
+resultado na memória. Cada medição roda em um processo isolado e usa o pico de
+memória residente reportado pelo sistema operacional: `ru_maxrss` no Linux e no
+macOS, `PeakWorkingSetSize` (psapi) no Windows.
 
 No SEG-Y real de 288.694 traços e 850 amostras, as medianas para 4.096, 16.384 e
 65.536 traços foram, respectivamente, `197,6`, `445,2` e `1.435,2 MB` na abordagem

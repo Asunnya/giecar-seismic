@@ -1,4 +1,5 @@
 import json
+import sys
 
 import numpy as np
 import pytest
@@ -7,6 +8,7 @@ from benchmarks.memory_benchmark import (
     BenchmarkResult,
     aggregate_medians,
     iter_trace_ranges,
+    measure_peak_rss_mb,
     peak_rss_to_mb,
     stream_filter_to_hdf5,
     validate_request,
@@ -87,6 +89,47 @@ def test_peak_rss_conversion_is_platform_specific():
     assert peak_rss_to_mb(2 * 1024**2, platform="darwin") == 2.0
 
 
+def test_peak_rss_conversion_rejects_unsupported_platform():
+    with pytest.raises(ValueError, match="unsupported platform"):
+        peak_rss_to_mb(2048, platform="win32")
+
+
+def test_measure_peak_rss_on_windows_uses_peak_working_set(monkeypatch):
+    # Windows has no ``resource`` module: the peak working set (bytes) is the
+    # equivalent of ru_maxrss and is converted to MiB.
+    monkeypatch.setattr(
+        "benchmarks.memory_benchmark._peak_working_set_bytes_windows",
+        lambda: 3 * 1024**2,
+    )
+    assert measure_peak_rss_mb(platform="win32") == 3.0
+
+
+def test_measure_peak_rss_reports_unsupported_platform_instead_of_import_error(
+    monkeypatch,
+):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "resource":
+            raise ImportError("No module named 'resource'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.delitem(sys.modules, "resource", raising=False)
+    with pytest.raises(ValueError, match="not supported on platform"):
+        measure_peak_rss_mb(platform="cygwin")
+
+
+@pytest.mark.skipif(
+    sys.platform not in ("win32", "darwin") and not sys.platform.startswith("linux"),
+    reason="peak RSS is measured on Linux, macOS and Windows only",
+)
+def test_measure_peak_rss_is_positive_on_supported_platforms():
+    assert measure_peak_rss_mb() > 0
+
+
 def test_result_json_contains_expected_fields():
     result = BenchmarkResult(
         strategy="streaming",
@@ -112,8 +155,13 @@ def test_result_json_contains_expected_fields():
 
 def test_aggregation_uses_median_for_each_strategy_and_trace_count():
     records = [
-        {"strategy": "naive", "trace_count": 10, "peak_rss_mb": value,
-         "additional_peak_mb": value - 10, "elapsed_seconds": value / 10}
+        {
+            "strategy": "naive",
+            "trace_count": 10,
+            "peak_rss_mb": value,
+            "additional_peak_mb": value - 10,
+            "elapsed_seconds": value / 10,
+        }
         for value in (30.0, 10.0, 20.0)
     ]
     aggregated = aggregate_medians(records)
