@@ -17,8 +17,7 @@ para que a interface continue respondendo durante leituras, cálculos e escritas
 ![Demonstração da aplicação](demo.webp)
 
 Importação do SEG-Y, execução do filtro com cancelamento e retomada, e comparação
-original × filtrado no visualizador (animação em 2× de velocidade; vídeo completo
-em [`demo.mp4`](demo.mp4)).
+original × filtrado no visualizador (animação em 2× de velocidade).
 
 ## Funcionalidades
 

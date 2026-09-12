@@ -12,3 +12,5 @@ __pycache__/
 htmlcov/
 CLAUDE.md
 AGENTS.md
+# demo source video (only the animated WebP is versioned)
+demo.mp4
