@@ -11,9 +11,13 @@ import numpy as np
 import pytest
 from PyQt5.QtWidgets import QWidget
 
-from giecar_seismic.application.filter_jobs import FilterJobService
+from giecar_seismic.application.filter_jobs import (
+    CancellationWindowClosedError,
+    FilterJobService,
+    NoActiveExecutionError,
+)
 from giecar_seismic.domain.dataset import SeismicDataset
-from giecar_seismic.domain.job import Job, JobStatus
+from giecar_seismic.domain.job import InvalidTransitionError, Job, JobStatus
 from giecar_seismic.ui import workers as workers_module
 from giecar_seismic.ui.main_window import (
     CREATED_AT_COLUMN,
@@ -571,3 +575,37 @@ def test_historical_completed_job_enables_view_output_without_the_session_datase
     window._jobs_table.selectRow(0)  # id 4: FAILED, no output
     assert window._view_output_button.isEnabled() is False
     assert window._open_output_button.isEnabled() is False
+
+
+# --- M2: cancel rejections are reported, never swallowed ----------------------
+
+
+class _RejectingService(FilterJobService):
+    def __init__(self, error):
+        super().__init__(FakeDatasetRepository([_dataset(1)]), RecordingJobRepository())
+        self.error = error
+
+    def cancel_job(self, job_id):
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        (CancellationWindowClosedError("closed"), "finaliz"),
+        (NoActiveExecutionError("nobody"), "no active"),
+        (
+            InvalidTransitionError("cannot cancel a job in status COMPLETED"),
+            "cannot cancel",
+        ),
+    ],
+)
+def test_cancel_rejection_is_shown_in_the_status_label(qapp, error, expected):
+    window = MainWindow(service=_RejectingService(error))
+    window._current_job_id = 1
+
+    window._cancel_button.setEnabled(True)
+    window._cancel_button.click()
+
+    assert expected in window._status_label.text().lower()
+    assert window.isEnabled()

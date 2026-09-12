@@ -27,12 +27,19 @@ from PyQt5.QtWidgets import (
 )
 
 from giecar_seismic.application.filter_jobs import (
+    CancellationWindowClosedError,
     CooperativeCancelToken,
     FilterJobService,
     InvalidFilterParametersError,
+    NoActiveExecutionError,
 )
 from giecar_seismic.domain.dataset import SeismicDataset
-from giecar_seismic.domain.job import FilterType, Job, JobStatus
+from giecar_seismic.domain.job import (
+    FilterType,
+    InvalidTransitionError,
+    Job,
+    JobStatus,
+)
 from giecar_seismic.ui.filter_labels import FILTER_LABELS, FILTER_NAMES, cutoff_summary
 from giecar_seismic.ui.workers import (
     DatasetImporter,
@@ -599,8 +606,23 @@ class MainWindow(QMainWindow):
             # is never touched here -- it keeps running until the worker
             # observes the request and one of the terminal signals fires.
             self._service.cancel_job(self._current_job_id)
-        except Exception:  # noqa: BLE001, S110 -- a benign race (job already finished) must not crash the GUI
-            pass
+        except CancellationWindowClosedError:
+            # The service refused on purpose: the worker already committed
+            # to finalize(). Say so instead of pretending to cancel.
+            self._status_label.setText(
+                "Cancel refused: the job is already finalizing its output "
+                "and will complete."
+            )
+        except NoActiveExecutionError:
+            self._status_label.setText(
+                "Cancel refused: no active execution for this job."
+            )
+        except InvalidTransitionError as exc:
+            self._status_label.setText(f"Cancel refused: {exc}")
+        except Exception as exc:  # noqa: BLE001 -- a benign race must not crash the GUI, but must be visible
+            self._status_label.setText(f"Cancel failed: {exc}")
+        else:
+            self._status_label.setText("Cancelling at the next chunk boundary...")
 
     # -- Signal handlers (run on the GUI thread) ------------------------
 
