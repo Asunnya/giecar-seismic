@@ -90,6 +90,8 @@ ViewerOpener = Callable[[ViewerTarget, QWidget], QWidget]
 # Keeps the cutoff spinbox strictly below Nyquist (0 < cutoff_hz <
 # nyquist_hz, per FilterJobService.create_filter_job) by one step.
 CUTOFF_EPSILON_HZ = 0.01
+BAND_HINT = "Band-pass requires low < high < Nyquist."
+BAND_ORDER_HINT = "Low cutoff must be below the high cutoff."
 
 
 class MainWindow(QMainWindow):
@@ -243,17 +245,18 @@ class MainWindow(QMainWindow):
         self._upper_cutoff_spinbox.setValue(40.0)
         self._upper_cutoff_label = QLabel("High cutoff (Hz):", group)
         form.addRow(self._upper_cutoff_label, self._upper_cutoff_spinbox)
-        self._band_hint = QLabel(
-            "Band-pass requires low < high < Nyquist. Raise high first to raise low.",
-            group,
-        )
+        self._band_hint = QLabel(BAND_HINT, group)
         self._band_hint.setWordWrap(True)
         form.addRow(self._band_hint)
         self._filter_type_combo.currentIndexChanged.connect(
             self._update_filter_controls
         )
-        self._cutoff_spinbox.valueChanged.connect(self._update_filter_controls)
-        self._upper_cutoff_spinbox.valueChanged.connect(self._update_filter_controls)
+        # A value change only re-evaluates validity (buttons, hint). Ranges
+        # are configured by dataset/filter type, never per keystroke: with
+        # keyboard tracking, resetting the edited spinbox's range on each
+        # valueChanged would re-validate the partial text against it.
+        self._cutoff_spinbox.valueChanged.connect(self._on_cutoff_changed)
+        self._upper_cutoff_spinbox.valueChanged.connect(self._on_cutoff_changed)
 
         self._order_spinbox = QSpinBox(group)
         self._order_spinbox.setRange(2, 8)
@@ -467,6 +470,8 @@ class MainWindow(QMainWindow):
         return self._filter_type_combo.currentData()
 
     def _update_filter_controls(self, *_args: object) -> None:
+        """Dataset or filter-type change: labels, visibility and the base
+        ranges of both cutoff spinboxes. Not called per keystroke."""
         band = self.filter_type is FilterType.BAND_PASS
         self._cutoff_label.setText(
             "High cutoff (Hz):"
@@ -483,19 +488,23 @@ class MainWindow(QMainWindow):
             if self._dataset is not None
             else 1_000_000.0
         )
-        low, high = self._cutoff_spinbox, self._upper_cutoff_spinbox
-        low.blockSignals(True)
-        high.blockSignals(True)
-        try:
-            low.setRange(CUTOFF_EPSILON_HZ, max(CUTOFF_EPSILON_HZ, maximum))
-            high.setRange(CUTOFF_EPSILON_HZ, max(CUTOFF_EPSILON_HZ, maximum))
-            if band and maximum >= 2 * CUTOFF_EPSILON_HZ:
-                low.setMaximum(maximum - CUTOFF_EPSILON_HZ)
-                high.setMinimum(low.value() + CUTOFF_EPSILON_HZ)
-                low.setMaximum(high.value() - CUTOFF_EPSILON_HZ)
-        finally:
-            low.blockSignals(False)
-            high.blockSignals(False)
+        # Both cutoffs share the same base range. The band-pass ordering
+        # (low < high) is deliberately NOT a spinbox bound: Qt rejects any
+        # partial text above a maximum, so a low bounded by the current high
+        # cannot be typed past it. Ordering gates Run/Preview instead.
+        for spinbox in (self._cutoff_spinbox, self._upper_cutoff_spinbox):
+            spinbox.blockSignals(True)
+            try:
+                spinbox.setRange(CUTOFF_EPSILON_HZ, max(CUTOFF_EPSILON_HZ, maximum))
+            finally:
+                spinbox.blockSignals(False)
+        self._on_cutoff_changed()
+
+    def _on_cutoff_changed(self, *_args: object) -> None:
+        """Any cutoff value change (typed or stepped): validity only."""
+        band = self.filter_type is FilterType.BAND_PASS
+        ordered = self._cutoff_spinbox.value() < self._upper_cutoff_spinbox.value()
+        self._band_hint.setText(BAND_HINT if ordered or not band else BAND_ORDER_HINT)
         self._refresh_controls()
 
     # -- Run / Cancel ----------------------------------------------------

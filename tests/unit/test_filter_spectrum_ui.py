@@ -42,10 +42,19 @@ def test_configuration_controls_and_nyquist(qapp, kind, label, upper_visible):
         assert window._cutoff_spinbox.maximum() < 125
         assert window._upper_cutoff_spinbox.maximum() < 125
         if upper_visible:
+            # low < high is not a widget bound (that would block typing a
+            # 3-digit low): values stay as set, Run/Preview are gated and
+            # create_filter_job() remains the authority.
             window._cutoff_spinbox.setValue(124.99)
-            assert window._cutoff_spinbox.value() < window._upper_cutoff_spinbox.value()
+            assert window._cutoff_spinbox.value() == pytest.approx(124.99)
+            assert window._upper_cutoff_spinbox.value() == pytest.approx(40.0)
+            assert not window._run_button.isEnabled()
             window._upper_cutoff_spinbox.setValue(0.01)
-            assert window._cutoff_spinbox.value() < window._upper_cutoff_spinbox.value()
+            assert window._upper_cutoff_spinbox.value() == pytest.approx(0.01)
+            assert not window._run_button.isEnabled()
+            window._cutoff_spinbox.setValue(0.005)  # rounds to the 0.01 floor
+            window._upper_cutoff_spinbox.setValue(0.02)
+            assert window._cutoff_spinbox.value() == pytest.approx(0.01)
     finally:
         window.close()
 
