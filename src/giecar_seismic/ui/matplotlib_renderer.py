@@ -11,6 +11,7 @@ from giecar_seismic.application.seismic_viewer import (
     TraceSpectrum,
     TraceView,
 )
+from giecar_seismic.ui.matplotlib_spectrum_renderer import MatplotlibSpectrumRenderer
 from giecar_seismic.ui.seismic_renderer import (
     DisplaySettings,
     PanelRender,
@@ -52,10 +53,11 @@ class MatplotlibSeismicRenderer(SeismicRenderer):
         analysis_layout = QVBoxLayout(self._analysis_panel)
         self._trace_figure = Figure(figsize=(4, 3), tight_layout=True)
         self._trace_canvas = FigureCanvasQTAgg(self._trace_figure)
-        self._spectrum_figure = Figure(figsize=(4, 3), tight_layout=True)
-        self._spectrum_canvas = FigureCanvasQTAgg(self._spectrum_figure)
+        self._spectrum_renderer = MatplotlibSpectrumRenderer(toolbar=False)
+        self._spectrum_figure = self._spectrum_renderer.figure
+        self._spectrum_canvas = self._spectrum_renderer.canvas
         analysis_layout.addWidget(self._trace_canvas)
-        analysis_layout.addWidget(self._spectrum_canvas)
+        analysis_layout.addWidget(self._spectrum_renderer.widget())
 
         self._images: list = []  # reusable imshow artists, one per panel
         self._images_key: tuple[int, str] | None = None  # (n_panels, cmap)
@@ -139,7 +141,6 @@ class MatplotlibSeismicRenderer(SeismicRenderer):
     ) -> None:
         self.last_spectrum = spectrum
         self._trace_figure.clear()
-        self._spectrum_figure.clear()
         if view is not None:
             ax = self._trace_figure.subplots()
             ax.plot(view.original, view.time_ms, label="original", linewidth=0.8)
@@ -151,48 +152,11 @@ class MatplotlibSeismicRenderer(SeismicRenderer):
             ax.set_ylabel("Time (ms)")
             ax.set_title(f"Trace {view.geometry.trace_index}")
             ax.legend(loc="lower right", fontsize="small")
-        if spectrum is not None:
-            ax = self._spectrum_figure.subplots()
-            ax.plot(
-                spectrum.frequencies_hz,
-                spectrum.original,
-                label="original",
-                linewidth=0.8,
-            )
-            ax.plot(
-                spectrum.frequencies_hz,
-                spectrum.filtered,
-                label="filtered",
-                linewidth=0.8,
-            )
-            for marker in spectrum.cutoff_markers:
-                ax.axvline(
-                    marker.frequency_hz,
-                    color="red",
-                    linestyle="--",
-                    label=f"{marker.label} {marker.frequency_hz} Hz",
-                )
-            if spectrum.show_filter_response and spectrum.filter_response is not None:
-                response_ax = ax.twinx()
-                response_ax.plot(
-                    spectrum.frequencies_hz,
-                    spectrum.filter_response,
-                    color="green",
-                    linestyle=":",
-                    label="Filter response (zero-phase)",
-                )
-                response_ax.set_ylabel(spectrum.response_label, color="green")
-                response_ax.tick_params(axis="y", colors="green")
-                response_ax.legend(loc="lower left", fontsize="small")
-            ax.set_xlim(0.0, spectrum.nyquist_hz)
-            ax.set_xlabel("Frequency (Hz)")
-            ax.set_ylabel(spectrum.magnitude_label)
-            ax.set_title("Amplitude spectrum")
-            ax.legend(loc="upper right", fontsize="small")
+        self._spectrum_renderer.show_spectrum(spectrum)
         self._trace_canvas.draw_idle()
-        self._spectrum_canvas.draw_idle()
 
     def dispose(self) -> None:
+        self._spectrum_renderer.dispose()
         self._section_canvas.mpl_disconnect(self._click_cid)
         for widget in (self._section_panel, self._analysis_panel):
             widget.setParent(None)  # type: ignore[call-overload]

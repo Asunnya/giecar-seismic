@@ -145,9 +145,9 @@ class TraceSpectrum:
     @property
     def magnitude_label(self) -> str:
         return (
-            "Magnitude (dB re original peak)"
+            "Magnitude (dB)"
             if self.scale is SpectrumScale.DB
-            else "|Amplitude|"
+            else "Magnitude"
         )
 
     @property

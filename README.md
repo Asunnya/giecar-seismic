@@ -69,6 +69,51 @@ Scale/response toggles transform cached magnitudes only. Renderer switches reuse
 those display data. Neither operation rereads SEG-Y/HDF5, repeats the FFT, or
 starts a worker. The renderers only draw scientific data supplied by the application.
 
+### Detached Spectrum window
+
+Select a trace, then click **Open Spectrum**. The modeless 1100×760 window
+can remain open while selecting other traces. Repeated clicks bring the same
+window forward; each viewer owns at most one. Closing it releases its renderer
+and disconnects signals. Closing the viewer also closes its spectrum window;
+the existing guard against closing during a section load still applies.
+
+The existing application `TraceSpectrum` is the shared spectrum data object:
+
+```text
+application → TraceSpectrum → SeismicViewer → embedded spectrum
+                                          → SpectrumWindow
+```
+
+Opening the window passes the exact current display object, including the
+already computed response. It calls no service/repository, reads no SEG-Y/HDF5,
+performs no Butterworth/FFT calculation and starts no worker. Scale conversions
+remain in the application function `spectrum_for_display`; both presentations
+receive the same result. Scientific processing is unchanged.
+
+**State policy:** Linear/dB belongs to `SeismicViewer` and stays synchronized in
+both directions, including while no trace is selected. Renderer choice and
+Original/Filtered/Filter response visibility are local to the detached window;
+initial renderer/response follow the embedded view. Hiding all curves produces
+an explicit empty-state message. Closing/reopening resets these local controls.
+
+Navigation clears the selected spectrum and disables Open Spectrum until another
+trace is selected. The open window shows a selection prompt. The existing single
+in-flight section load remains; request identities reject stale/duplicate results,
+and clicks on the old section are ignored during loading.
+
+A minimal `SpectrumRenderer` is reused by **both** embedded and detached views.
+Matplotlib reuses its `Line2D` artists and provides a native navigation toolbar;
+PyQtGraph reuses its items with `setData()` and provides native zoom/pan. Only
+presentation is performed on the GUI thread. Response gain retains its separate
+right axis; frequency remains linear.
+
+Interactive smoke on a Linux graphical session, with temporary real SEG-Y/SQLite/
+HDF5 data (12 traces × 1024 samples), exercised all three filters, both renderers,
+resize, native zoom/pan, visibility, scale synchronization and live trace updates.
+Observed click-to-first-completed-Qt-paint times: **PyQtGraph 45–52 ms** (three
+openings), **Matplotlib 96 ms** (one opening). These are local observations, not a
+pytest benchmark or a guarantee for other machines.
+
 ## Development database schema change
 
 Jobs now persist `filter_type` as the enum **name** (`LOW_PASS`, `HIGH_PASS`,

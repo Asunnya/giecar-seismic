@@ -60,6 +60,7 @@ from giecar_seismic.ui.seismic_renderer import (
     DisplaySettings,
     SeismicRenderer,
 )
+from giecar_seismic.ui.spectrum_window import SpectrumWindow
 from giecar_seismic.ui.viewer_workers import (
     GeometryIndexBuilder,
     GeometryIndexWorker,
@@ -97,6 +98,9 @@ class SeismicViewer(QDialog):
         self._selected_spectrum: TraceSpectrum | None = None
         self._display_spectrum: TraceSpectrum | None = None
         self._renderer: SeismicRenderer | None = None
+        self._spectrum_window: SpectrumWindow | None = None
+        self._section_request_id = 0
+        self._pending_section_request: int | None = None
         self._section_was_clicked = False
         # A line requested while a thread is still winding down (e.g. the
         # first line right after the geometry index finished) starts once
@@ -204,6 +208,10 @@ class SeismicViewer(QDialog):
         spectrum_bar.addWidget(self._spectrum_scale_combo)
         trace_layout.addLayout(spectrum_bar)
         trace_layout.addWidget(self._response_checkbox)
+        self._open_spectrum_button = QPushButton("Open Spectrum", self)
+        self._open_spectrum_button.setEnabled(False)
+        self._open_spectrum_button.clicked.connect(self._open_spectrum)
+        trace_layout.addWidget(self._open_spectrum_button)
         self._analysis_slot = QVBoxLayout()
         trace_layout.addLayout(self._analysis_slot, 1)
 
@@ -309,13 +317,30 @@ class SeismicViewer(QDialog):
         self._request_line(nearest)
 
     def _request_line(self, line_number: int) -> None:
+        self._section_request_id += 1
+        request_id = self._section_request_id
+        self._pending_section_request = request_id
+        self._selected = None
+        self._selected_spectrum = None
+        self._display_spectrum = None
+        self._show_selected_trace()
         self._status_label.setText(f"Loading {self.orientation.value} {line_number}...")
         worker = SectionLoadWorker(
             self._service, self._job_id, self.orientation, line_number
         )
-        worker.loaded.connect(self._on_section_loaded)
+        worker.loaded.connect(
+            lambda section: self._accept_section_result(request_id, section)
+        )
         worker.failed.connect(self._on_load_failed)
         self._start_worker(worker)
+
+    def _accept_section_result(self, request_id: int, section: SeismicSection) -> None:
+        # Single in-flight load is still the policy. Consume each result once;
+        # an obsolete/duplicate delivery cannot clear a newer trace selection.
+        if request_id != self._pending_section_request:
+            return
+        self._pending_section_request = None
+        self._on_section_loaded(section)
 
     def _on_section_loaded(self, section: SeismicSection) -> None:
         self._section = section
@@ -332,6 +357,7 @@ class SeismicViewer(QDialog):
         self._show_selected_trace()
 
     def _on_load_failed(self, message: str) -> None:
+        self._pending_section_request = None
         self._status_label.setText(f"Failed: {message}")
 
     # -- renderer lifecycle ------------------------------------------------------
@@ -390,7 +416,7 @@ class SeismicViewer(QDialog):
             )
 
     def select_coordinate(self, coordinate: float) -> None:
-        if self._section is None:
+        if self._section is None or self._thread is not None:
             return
         self._section_was_clicked = True
         view = self._service.select_trace(self._job_id, self._section, coordinate)
@@ -434,6 +460,39 @@ class SeismicViewer(QDialog):
                 f"{cutoffs}, order {j.order}"
             )
         self.renderer.show_trace(view, self._display_spectrum)
+        self._open_spectrum_button.setEnabled(self._display_spectrum is not None)
+        if self._spectrum_window is not None:
+            self._spectrum_window.set_scale(
+                SpectrumScale(self._spectrum_scale_combo.currentText())
+            )
+            self._spectrum_window.set_spectrum(view, self._display_spectrum)
+
+    def _open_spectrum(self) -> None:
+        if self._selected is None or self._display_spectrum is None:
+            return
+        if self._spectrum_window is None:
+            window = SpectrumWindow(
+                self._selected,
+                self._display_spectrum,
+                self,
+                renderer_name=self._renderer_combo.currentText(),
+            )
+            self._spectrum_window = window
+            window.scale_requested.connect(self._set_spectrum_scale)
+            window.finished.connect(self._on_spectrum_window_closed)
+        self._spectrum_window.show()
+        self._spectrum_window.raise_()
+        self._spectrum_window.activateWindow()
+
+    def _set_spectrum_scale(self, scale: str) -> None:
+        self._spectrum_scale_combo.setCurrentText(scale)
+
+    def _on_spectrum_window_closed(self, _result: int) -> None:
+        window = self._spectrum_window
+        if window is not None:
+            window.scale_requested.disconnect(self._set_spectrum_scale)
+            window.finished.disconnect(self._on_spectrum_window_closed)
+            self._spectrum_window = None
 
     # -- shutdown ------------------------------------------------------------------
 
@@ -448,8 +507,14 @@ class SeismicViewer(QDialog):
             )
             event.ignore()
             return
+        if self._spectrum_window is not None:
+            self._spectrum_window.close()
         if self._renderer is not None:
             self._renderer.coordinate_clicked.disconnect(self.select_coordinate)
             self._renderer.dispose()
             self._renderer = None
         event.accept()
+
+    def reject(self) -> None:
+        # Escape follows the same worker guard and child-window cleanup as X.
+        self.close()
