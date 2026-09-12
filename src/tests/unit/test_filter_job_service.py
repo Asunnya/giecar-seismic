@@ -5,6 +5,7 @@ from giecar_seismic.application.filter_jobs import (
     FilterJobService,
     InvalidFilterParametersError,
     JobNotFoundError,
+    NoActiveExecutionError,
 )
 from giecar_seismic.domain.dataset import SeismicDataset
 from giecar_seismic.domain.job import InvalidTransitionError, Job, JobStatus
@@ -130,13 +131,22 @@ def test_cancel_job_raises_when_job_does_not_exist(service):
         service.cancel_job(999)
 
 
-def test_cancel_job_moves_running_job_to_cancelled_and_persists_it(service, dataset):
+def test_cancel_job_rejects_running_job_with_no_active_execution_registered(
+    service, dataset
+):
+    # Forcing RUNNING directly on the domain object (bypassing
+    # run_filter_job()) simulates a job that is RUNNING but has nobody
+    # listening for a cancellation request -- no run_filter_job()
+    # execution is registered for it. cancel_job() must not report
+    # success for a request nobody will ever observe: it raises
+    # explicitly instead of silently no-op'ing as if accepted.
     created = service.create_filter_job(dataset_id=dataset.id, cutoff_hz=30.0, order=4)
     created.start()
 
-    service.cancel_job(created.id)
+    with pytest.raises(NoActiveExecutionError):
+        service.cancel_job(created.id)
 
-    assert service.get_job_status(created.id).status is JobStatus.CANCELLED
+    assert service.get_job_status(created.id).status is JobStatus.RUNNING
 
 
 def test_cancel_job_on_non_running_job_raises_invalid_transition(service, dataset):
@@ -146,3 +156,27 @@ def test_cancel_job_on_non_running_job_raises_invalid_transition(service, datase
         service.cancel_job(created.id)
 
     assert service.get_job_status(created.id).status is JobStatus.CREATED
+
+
+@pytest.mark.parametrize(
+    "reach_terminal_status",
+    [
+        lambda job: job.complete(),
+        lambda job: job.fail("boom"),
+        lambda job: job.cancel(),
+    ],
+    ids=["completed", "failed", "cancelled"],
+)
+def test_cancel_job_rejects_jobs_already_in_a_terminal_status(
+    service, dataset, reach_terminal_status
+):
+    created = service.create_filter_job(dataset_id=dataset.id, cutoff_hz=30.0, order=4)
+    created.start()
+    reach_terminal_status(created)
+    terminal_status = created.status
+
+    with pytest.raises(InvalidTransitionError):
+        service.cancel_job(created.id)
+
+    # rejection must not have disturbed the already-terminal status
+    assert service.get_job_status(created.id).status is terminal_status
