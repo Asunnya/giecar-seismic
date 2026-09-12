@@ -293,6 +293,7 @@ memória limitada na importação, renderizadores e comunicação da interface.
 | Datasets, jobs e geometria precisam sobreviver ao fechamento. | Usar SQLite com SQLAlchemy. | Banco local simples, consultas claras e domínio sem dependência do ORM. | Não há migrações automáticas; mudanças de schema exigem ação consciente. |
 | A saída é grande e precisa ser gravada aos poucos. | Usar HDF5 com dataset extensível. | Escrita incremental, leitura seletiva e um arquivo por job. | O flush por chunk tem custo e o arquivo exige consistência cuidadosa na retomada. |
 | Um processamento cancelado pode já ter horas de trabalho. | Confirmar checkpoint por chunk e permitir a retomada de `CANCELLED`. | Evita repetir CPU e I/O já concluídos. | HDF5 e SQLite não formam uma transação única; divergências precisam ser reconciliadas ou rejeitadas. |
+| Um job cancelado ou com falha deixa um HDF5 parcial. | Preservar o arquivo parcial deliberadamente (marcado `complete=False`), sem rollback automático. A alternativa, apagar a saída no cancelamento ou na falha, foi descartada porque o projeto prioriza a retomada: o rollback apagaria justamente o checkpoint necessário para continuar, e o HDF5 é a autoridade sobre o que foi fisicamente gravado. | Retomada possível sem reprocessar; o estado em disco é sempre inspecionável. | Saídas parciais abandonadas ocupam disco até serem removidas pelo usuário. |
 | A malha pode ter posições ausentes. | Abrir SEG-Y com `ignore_geometry=True` e indexar traços físicos. | Malhas irregulares continuam válidas. | O índice de geometria precisa ser construído separadamente. |
 | Precisamos de rastreabilidade da execução de cada job, inclusive após reiniciar. | Arquivo de log dedicado por job usando `logging`, em vez de uma tabela de eventos no SQLite. Não precisamos consultar nem agregar eventos; para o escopo atual, um arquivo sequencial é mais simples. | Baixo acoplamento (o serviço conhece só uma porta `log(job_id, level, event, message)`), fácil inspeção e best-effort: falha ao gravar o log nunca altera o estado do job. | Logs não são consultáveis relacionalmente. Se no futuro houver busca, agregação ou auditoria centralizada, SQLite ou outra estrutura pode ser mais apropriada. |
 
@@ -358,7 +359,11 @@ melhor para todos os cenários; ele foi o formato mais adequado ao escopo adotad
 ## Simplificações e limitações assumidas
 
 - Aplicação e armazenamento voltados para uso local em desktop.
-- Sem multiprocessing, processamento distribuído ou armazenamento remoto.
+- Multiprocessing é opcional (`GIECAR_FILTER_PROCESSES`) e restrito à filtragem dos
+  grupos de traços de cada chunk; não há processamento distribuído nem armazenamento
+  remoto.
+- Saídas parciais de jobs cancelados ou com falha não são apagadas automaticamente:
+  o arquivo fica marcado como incompleto e é o checkpoint de uma eventual retomada.
 - Sem Alembic; bancos antigos precisam ser atualizados ou recriados manualmente.
 - Retomada somente para jobs `CANCELLED`, no mesmo HDF5. Jobs `FAILED` e `COMPLETED`
   não são retomados.
