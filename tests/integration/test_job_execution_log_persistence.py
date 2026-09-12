@@ -115,3 +115,61 @@ def test_multiprocessing_run_logs_once_from_the_coordinator_only(tmp_path):
             rtol=1e-5,
             atol=1e-6,
         )
+
+
+def test_job_left_running_by_a_crash_is_recovered_and_resumable(tmp_path):
+    from giecar_seismic.domain.job import JobStatus as _S
+
+    amplitudes = write_segy(tmp_path / "survey.segy", FOOTPRINTS[0], 64, 4000)
+    engine, importer, service = compose(tmp_path)
+    dataset = importer(str(tmp_path / "survey.segy"), "survey")
+    job = service.create_filter_job(dataset.id, 30, 4)
+    token = CooperativeCancelToken()
+    job = service.run_filter_job(job.id, lambda _: token.request_cancel(), token)
+    assert job.status is _S.CANCELLED and job.processed_traces == 2
+    # Simulate the crash: the row says RUNNING, the HDF5 holds the flushed
+    # prefix, and no process is executing it.
+    jobs = SqlAlchemyJobRepository(make_session_factory(engine))
+    job.status = _S.RUNNING
+    job.finished_at = None
+    jobs.update(job)
+    engine.dispose()
+
+    # "restart"
+    engine, _, service = compose(tmp_path)
+    recovered = service.recover_interrupted_jobs()
+    assert [j.id for j in recovered] == [job.id]
+    assert service.get_job_status(job.id).status is _S.CANCELLED
+    assert service.recover_interrupted_jobs() == []
+
+    reads = []
+    reader_factory = service._reader_factory
+
+    def counting(dataset):
+        reader = reader_factory(dataset)
+        inner = reader.read_chunk
+        reader.read_chunk = lambda a, b: (reads.append((a, b)), inner(a, b))[1]
+        return reader
+
+    service._reader_factory = counting
+    done = service.resume_filter_job(job.id, lambda _: None, CooperativeCancelToken())
+    engine.dispose()
+
+    assert done.status is JobStatus.COMPLETED
+    assert reads[0] == (2, 4)  # continues after the checkpoint, no reprocessing
+    with h5py.File(done.output_path, "r") as file:
+        assert file.attrs["complete"]
+        np.testing.assert_allclose(
+            file["traces"][:],
+            apply_lowpass_filter(amplitudes, 30, 4, 4).astype(np.float32),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+    assert _events(read_job_log(tmp_path / "logs", job.id)) == [
+        "JOB_CREATED",
+        "RUN_STARTED",
+        "JOB_CANCELLED",
+        "JOB_INTERRUPTED",
+        "RESUME_STARTED",
+        "JOB_COMPLETED",
+    ]

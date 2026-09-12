@@ -18,6 +18,7 @@ from giecar_seismic.application.job_logging import (
     JOB_COMPLETED,
     JOB_CREATED,
     JOB_FAILED,
+    JOB_INTERRUPTED,
     RESUME_STARTED,
     RUN_STARTED,
     JobExecutionLogger,
@@ -385,6 +386,38 @@ class FilterJobService:
             f"Job criado para o dataset {job.dataset_id} com {self._describe_filter(job)}.",
         )
         return job
+
+    def recover_interrupted_jobs(self) -> list[Job]:
+        """Startup reconciliation for jobs left RUNNING by a crash.
+
+        A RUNNING job with no execution registered in this process was
+        interrupted (power loss, kill, OOM) -- this is a single-process
+        desktop application, so nothing else could be running it. Such a
+        job is moved to CANCELLED through the ordinary RUNNING -> CANCELLED
+        transition and nothing else is touched: processed_traces and the
+        HDF5 checkpoint stay exactly as persisted, so resume_filter_job()
+        applies its usual validation (fingerprint, written_trace_count vs
+        processed_traces) and continues from the durable prefix. Idempotent.
+        """
+        recovered: list[Job] = []
+        for job in self._jobs.list(status=JobStatus.RUNNING):
+            if job.status is not JobStatus.RUNNING or job.id is None:
+                continue
+            with self._cancel_tokens_lock:
+                if job.id in self._cancel_tokens:
+                    continue  # genuinely running in this process
+            job.cancel()
+            self._jobs.update(job)
+            self._log(
+                job.id,
+                JobLogLevel.WARNING,
+                JOB_INTERRUPTED,
+                f"Execução interrompida sem término registrado; {job.processed_traces} "
+                "traces confirmados no checkpoint. Job marcado como CANCELLED para "
+                "permitir a retomada.",
+            )
+            recovered.append(job)
+        return recovered
 
     def list_jobs(
         self, dataset_id: int | None = None, status: JobStatus | None = None

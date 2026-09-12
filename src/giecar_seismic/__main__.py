@@ -97,6 +97,10 @@ def main() -> int:
         parallel_workers=parallel_workers,
         execution_logger=FileJobExecutionLogger(DEFAULT_LOGS_DIR),
     )
+    # A previous process may have died mid-run (the scenario Resume exists
+    # for): jobs it left RUNNING become CANCELLED so their HDF5 checkpoint
+    # is reachable through Resume. Before any window exists.
+    service.recover_interrupted_jobs()
 
     # Viewer: geometry index (built lazily, in bounded batches, on first
     # open) + selective SEG-Y/HDF5 readers -- the same physical index

@@ -30,6 +30,8 @@ JOB_CANCELLED = "JOB_CANCELLED"
 RESUME_STARTED = "RESUME_STARTED"
 JOB_COMPLETED = "JOB_COMPLETED"
 JOB_FAILED = "JOB_FAILED"
+# Startup reconciliation: a job found RUNNING with no live execution.
+JOB_INTERRUPTED = "JOB_INTERRUPTED"
 
 
 class JobExecutionLogger(Protocol):
