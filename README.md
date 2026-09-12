@@ -41,6 +41,14 @@ para que a interface continue respondendo durante leituras, cálculos e escritas
 - Espectro do traço selecionado em escala linear ou dB, com frequências de corte
   e resposta teórica do filtro.
 - Janela de Spectrum maior e não modal, sincronizada com a seleção do viewer.
+- Log de execução persistido por Job: um arquivo `job_<id>.log` append-only em
+  `~/.giecar-seismic/logs/`, escrito com a biblioteca padrão `logging`, que
+  permanece após reiniciar a aplicação e continua recebendo os eventos de uma
+  retomada. Só eventos de ciclo de vida são gravados (criação, início, pedido e
+  efetivação de cancelamento, retomada, conclusão, falha); não há linha por trace
+  nem por chunk, então o tamanho do log não depende do tamanho do survey. O botão
+  **View log** do histórico abre o arquivo em um diálogo somente leitura, lido
+  fora da thread da interface.
 
 ## Arquitetura da solução
 
@@ -211,11 +219,42 @@ processo coordenador.
 Os dados locais são criados em `~/.giecar-seismic/`:
 
 - `giecar.sqlite`: conjuntos de dados, jobs e índice de geometria;
-- `outputs/`: resultados HDF5.
+- `outputs/`: resultados HDF5;
+- `logs/`: um `job_<id>.log` por job, com os eventos de execução.
 
 O projeto não usa Alembic. `create_schema()` cria tabelas ausentes, mas não migra
 um banco de uma versão anterior. Para uma avaliação limpa, remova ou mova
 conscientemente um banco antigo antes de iniciar a versão atual.
+
+## Log de execução por Job
+
+Cada job tem um único arquivo de log em `~/.giecar-seismic/logs/job_<id>.log`,
+criado no primeiro evento e aberto sempre em modo append. O job é o identificador
+da trajetória inteira: uma retomada continua escrevendo no mesmo arquivo, e o
+conteúdo permanece após fechar e abrir a aplicação. Só o processo coordenador
+escreve; os subprocessos do multiprocessing nunca tocam no arquivo.
+
+Cada linha tem data e hora, nível e o código do evento seguido de uma mensagem:
+
+```
+2026-09-12 14:02:10 INFO JOB_CREATED - Job criado para o dataset 1 com Low-pass, cutoff 30 Hz, ordem 4.
+2026-09-12 14:02:15 INFO RUN_STARTED - Processamento iniciado: dataset 1, Low-pass, cutoff 30 Hz, ordem 4, chunk de 256 traces, 1 processo(s).
+2026-09-12 14:05:33 WARNING CANCEL_REQUESTED - Cancelamento solicitado; será atendido na próxima fronteira de chunk.
+2026-09-12 14:05:34 WARNING JOB_CANCELLED - Processamento cancelado após 43520 de 288694 traces.
+2026-09-12 15:10:07 INFO RESUME_STARTED - Processamento retomado a partir do trace 43520 de 288694 (retomada #1).
+2026-09-12 15:48:53 INFO JOB_COMPLETED - Processamento concluído: 288694 traces. Saída: ~/.giecar-seismic/outputs/job-42.h5
+```
+
+Eventos registrados: `JOB_CREATED`, `RUN_STARTED`, `CANCEL_REQUESTED` (somente
+quando o pedido é aceito), `JOB_CANCELLED`, `RESUME_STARTED`, `JOB_COMPLETED`
+(somente depois de o HDF5 ser finalizado) e `JOB_FAILED` (com a mensagem de erro
+curta, sem traceback). Não há linha por trace, por chunk nem por percentual.
+
+O log é observabilidade, não fonte de verdade: o estado do job continua no SQLite.
+Se o arquivo não puder ser criado ou escrito, o problema é reportado pelo `logging`
+padrão do processo e o job segue normalmente, sem mudar resultado, checkpoint ou
+estado. Na tela de histórico, o botão **View log** lê o arquivo fora da thread da
+interface e o mostra em um diálogo somente leitura.
 
 ## Como testar
 
@@ -255,6 +294,7 @@ memória limitada na importação, renderizadores e comunicação da interface.
 | A saída é grande e precisa ser gravada aos poucos. | Usar HDF5 com dataset extensível. | Escrita incremental, leitura seletiva e um arquivo por job. | O flush por chunk tem custo e o arquivo exige consistência cuidadosa na retomada. |
 | Um processamento cancelado pode já ter horas de trabalho. | Confirmar checkpoint por chunk e permitir a retomada de `CANCELLED`. | Evita repetir CPU e I/O já concluídos. | HDF5 e SQLite não formam uma transação única; divergências precisam ser reconciliadas ou rejeitadas. |
 | A malha pode ter posições ausentes. | Abrir SEG-Y com `ignore_geometry=True` e indexar traços físicos. | Malhas irregulares continuam válidas. | O índice de geometria precisa ser construído separadamente. |
+| Precisamos de rastreabilidade da execução de cada job, inclusive após reiniciar. | Arquivo de log dedicado por job usando `logging`, em vez de uma tabela de eventos no SQLite. Não precisamos consultar nem agregar eventos; para o escopo atual, um arquivo sequencial é mais simples. | Baixo acoplamento (o serviço conhece só uma porta `log(job_id, level, event, message)`), fácil inspeção e best-effort: falha ao gravar o log nunca altera o estado do job. | Logs não são consultáveis relacionalmente. Se no futuro houver busca, agregação ou auditoria centralizada, SQLite ou outra estrutura pode ser mais apropriada. |
 
 ### Multiprocessing: quando usar
 
