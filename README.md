@@ -47,30 +47,22 @@ original × filtrado no visualizador (animação em 2× de velocidade).
   diferença; **View Output** abre direto na seção filtrada.
 - Exibição raster ou wiggle, ajuste de ganho, clip e mapa de cores.
 - Renderização com PyQtGraph ou Matplotlib.
-- **QC espectral por região:** um clique normal na seção mostra o traço
-  (amplitude × tempo, original vs filtrado) e o seu espectro; um segundo
-  clique estende a análise ao intervalo contíguo
-  entre os dois (crosslines numa inline, inlines numa crossline; qualquer
-  ordem, ambos os limites inclusos; um terceiro clique recomeça de um novo
-  traço). Todo traço fisicamente presente no intervalo entra;
-  posições ausentes do levantamento são excluídas e reportadas ("48 traces
-  present / 3 missing positions"). O painel da direita mostra na hora **uma**
-  curva agregada original e **uma** filtrada — a média, bin a bin, dos espectros
-  de amplitude de cada traço (ver decisão abaixo) — em escala linear ou dB, com
-  frequências de corte e resposta teórica do filtro; **Open Spectrum** abre a
-  mesma região numa janela maior, não modal. Uma região precisa de pelo menos 1
-  traço presente (um traço só é o caso de largura 1). A agregação roda numa QThread, em lotes de 64 traços, sobre
-  a seção já carregada: sem leitura de SEG-Y/HDF5/SQLite. O escopo é uma seção
-  exibida, não um subvolume 2D/3D.
-- **Preview** dos parâmetros antes de rodar o job: o botão **Preview** do grupo
-  Filter abre o mesmo viewer com o dataset importado (na seção original) e aplica
-  o filtro configurado (tipo, cortes e ordem) em memória apenas à seção em tela,
-  usando o mesmo projeto SOS do job. Nada é persistido: nenhum job é criado e nenhum HDF5
-  é escrito; a memória fica limitada a uma linha (`max_section_traces ×
-  n_samples`), nunca ao volume. Os parâmetros passam pela mesma validação de
-  `create_filter_job`, então o preview nunca mostra um filtro que o job
-  rejeitaria, e um teste end-to-end confirma que a seção do preview é igual à
-  lida do HDF5 de um job concluído com os mesmos parâmetros.
+- **QC espectral por região:** um clique na seção mostra o traço (amplitude ×
+  tempo, original vs filtrado) e o seu espectro; um segundo clique estende a
+  análise ao intervalo entre os dois cliques (em qualquer ordem; um terceiro
+  clique recomeça). Todo traço presente no intervalo entra; posições ausentes do
+  levantamento são excluídas e informadas no painel. O painel da direita mostra
+  uma curva agregada original e uma filtrada — a média dos espectros de amplitude
+  dos traços (ver decisão abaixo) — em escala linear ou dB, com as frequências de
+  corte e a resposta teórica do filtro; **Open Spectrum** abre a mesma região em
+  uma janela maior. O cálculo roda em segundo plano sobre a seção já carregada,
+  sem novas leituras de arquivo.
+- **Preview** dos parâmetros antes de rodar o job: o botão **Preview** abre o
+  viewer com o dataset importado e aplica o filtro configurado em memória apenas à
+  seção em tela, com o mesmo projeto de filtro do job. Nada é persistido: nenhum
+  job é criado e nenhum HDF5 é escrito. Os parâmetros passam pela mesma validação
+  do job, e um teste end-to-end confirma que o preview é igual ao resultado de um
+  job concluído com os mesmos parâmetros.
 - Log de execução persistido por Job: um arquivo `job_<id>.log` append-only em
   `~/.giecar-seismic/logs/`, escrito com a biblioteca padrão `logging`, que
   permanece após reiniciar a aplicação e continua recebendo os eventos de uma
@@ -218,24 +210,14 @@ sequenceDiagram
 
 ### Requisitos
 
-- Python 3.12 (série `3.12.x`; `requires-python = ">=3.12,<3.13"`).
-- Linux x86_64, Windows x86_64 (AMD64) ou macOS (Intel x86_64 ou Apple Silicon arm64).
-- Python 3.12 (série `3.12.x`; `requires-python = ">=3.12,<3.13"`).
-- Linux x86_64, Windows x86_64 (AMD64) ou macOS (Intel x86_64 ou Apple Silicon arm64).
+- Python 3.12.
+- Linux x86_64, Windows x86_64 ou macOS (Intel ou Apple Silicon).
 - [uv](https://docs.astral.sh/uv/).
 - Ambiente gráfico compatível com PyQt5 para abrir a aplicação.
 
-Esses ambientes estão declarados em `tool.uv.required-environments` no
-`pyproject.toml`, e o `uv.lock` é resolvido considerando ambos. Isso evita que o
-lock fixe uma dependência binária sem wheel na plataforma de destino (por exemplo,
-`PyQt5-Qt5` é resolvido para `5.15.2` no Windows e `5.15.19` no Linux e no macOS,
-todos dentro do intervalo exigido pelo `PyQt5`).
-
-Esses ambientes estão declarados em `tool.uv.required-environments` no
-`pyproject.toml`, e o `uv.lock` é resolvido considerando ambos. Isso evita que o
-lock fixe uma dependência binária sem wheel na plataforma de destino (por exemplo,
-`PyQt5-Qt5` é resolvido para `5.15.2` no Windows e `5.15.19` no Linux e no macOS,
-todos dentro do intervalo exigido pelo `PyQt5`).
+Esses ambientes estão declarados no `pyproject.toml`, e o `uv.lock` é resolvido
+para todos eles, de modo que cada plataforma receba dependências binárias com wheel
+disponível.
 
 Na raiz do repositório, sincronize o ambiente e as dependências:
 
@@ -303,10 +285,8 @@ interface e o mostra em um diálogo somente leitura.
 
 ## Como testar
 
-A mesma verificação roda no GitHub Actions (`.github/workflows/ci.yml`) a cada push e
-pull request, em Linux, Windows e macOS: `ruff check`, `ruff format --check`, `mypy src`
-e a suíte completa com `pytest --cov`, usando o `uv.lock` (`uv sync --locked`) e Qt em
-modo `offscreen`. Nenhum teste depende de `data/survey.segy`.
+As mesmas verificações rodam no GitHub Actions a cada push e pull request, em
+Linux, Windows e macOS: lint, tipos e a suíte completa de testes.
 
 A suíte está dividida por escopo:
 
@@ -332,7 +312,7 @@ O E2E principal cria um SEG-Y irregular temporário, importa e persiste o datase
 executa a filtragem em chunks, grava HDF5, fecha os recursos, reabre SQLite/HDF5 e
 compara numericamente o resultado. Há também testes para cancelamento, retomada,
 memória limitada na importação, renderizadores e comunicação da interface.
- 
+
 ### Multiprocessing: quando usar
 
 O pool nasce uma vez por execução do job e é encerrado em conclusão, falha ou
@@ -394,11 +374,10 @@ melhor para todos os cenários; ele foi o formato mais adequado ao escopo adotad
   traço isolado. O espectro regional é `mean_i |FFT(traço_i)|`, para original e
   filtrado separadamente, **nunca** `|FFT(mean_i traço_i)|`: a média no domínio
   do tempo deixa traços vizinhos se cancelarem por fase e suprime conteúdo
-  espectral real. A média é feita em magnitude linear, em lotes limitados
-  (`REGION_SPECTRUM_CHUNK_TRACES = 64`, memória temporária de lote × bins e não
-  região × bins), e só então convertida para dB (referência = pico do agregado
-  original, piso −120 dB); a resposta teórica é uma só, não N respostas. Como a
-  seção já está em memória, o custo não cresce com o tamanho do SEG-Y.
+  espectral real. A média é feita em magnitude linear, em lotes de 64 traços
+  (memória temporária limitada pelo lote, não pelo tamanho da região), e só então
+  convertida para dB; a resposta teórica é uma só. Como a seção já está em
+  memória, o custo não cresce com o tamanho do SEG-Y.
 - `processed_traces`, e não o percentual arredondado, define o ponto exato de
   retomada. O HDF5 é a autoridade do resultado físico já gravado.
 

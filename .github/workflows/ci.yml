@@ -4,6 +4,12 @@ on:
   push:
     branches: [master]
   pull_request:
+  workflow_dispatch:
+
+# The CI only reads the repository: no write access to contents, PRs,
+# packages or OIDC tokens, so it is safe to run on pull requests.
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -18,14 +24,15 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     env:
-      # Headless Qt: tests/conftest.py also sets this, but the app import
-      # path (uv run giecar-seismic --help style checks) must not need a display.
+      # Headless GUI stack on hosted runners: offscreen Qt platform plugin
+      # (tests/conftest.py also sets it) and a non-interactive Matplotlib backend.
       QT_QPA_PLATFORM: offscreen
+      MPLBACKEND: Agg
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -56,4 +63,19 @@ jobs:
         run: uv run mypy src
 
       - name: Tests
-        run: uv run pytest -q --cov=giecar_seismic --cov-report=term-missing
+        # One line on purpose: this step also runs under PowerShell on Windows.
+        run: uv run pytest -q --cov=giecar_seismic --cov-report=term-missing --cov-report=xml
+
+      # Pure-Python package (uv_build backend): one build is enough.
+      - name: Build package
+        if: runner.os == 'Linux'
+        run: uv build
+
+      - name: Upload coverage report
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: error
+          retention-days: 7
