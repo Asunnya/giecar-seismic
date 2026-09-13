@@ -88,6 +88,7 @@ from giecar_seismic.ui.viewer_workers import (
     RegionalSpectrumWorker,
     SectionLoadWorker,
 )
+from giecar_seismic.ui.window_flags import make_resizable_dialog
 
 log = logging.getLogger(__name__)
 
@@ -116,6 +117,7 @@ class SeismicViewer(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        make_resizable_dialog(self)
         self._service = service
         self._build_geometry_index = build_geometry_index
         self._target = target

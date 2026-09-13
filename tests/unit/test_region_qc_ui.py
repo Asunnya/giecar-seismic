@@ -438,6 +438,8 @@ def test_open_spectrum_shows_the_current_region_without_io_or_fft(
     assert isinstance(window, RegionSpectrumWindow)
     assert window.isVisible() and not window.isModal()
     assert window.windowModality() == Qt.NonModal
+    assert window.windowFlags() & Qt.WindowMaximizeButtonHint
+    assert window.windowFlags() & Qt.WindowMinimizeButtonHint
     assert window.regional is raw
     assert "Region: XL 1–4" in window._identity_label.text()
     assert "4 traces present" in window._identity_label.text()

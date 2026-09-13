@@ -7,6 +7,7 @@ import threading
 
 import numpy as np
 import pytest
+from PyQt5.QtCore import Qt
 
 from giecar_seismic.application.seismic_viewer import (
     FilterPreview,
@@ -441,3 +442,14 @@ def test_preview_target_reaches_every_service_call_and_is_labelled_as_such(
     assert regional is not None and regional.job.id is None
     assert [m.frequency_hz for m in regional.spectrum.cutoff_markers] == [25.0]
     viewer.close()
+
+
+def test_viewer_window_can_be_maximized_and_minimized(qapp, wait_for_signal):
+    # A plain QDialog gets no maximize/minimize title-bar buttons from the
+    # window manager; the viewer is a large, resizable window and must.
+    viewer, _, _ = _open(qapp, wait_for_signal)
+    flags = viewer.windowFlags()
+
+    assert flags & Qt.WindowMaximizeButtonHint
+    assert flags & Qt.WindowMinimizeButtonHint
+    assert not flags & Qt.WindowContextHelpButtonHint

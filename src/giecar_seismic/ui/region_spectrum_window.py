@@ -34,6 +34,7 @@ from giecar_seismic.ui.matplotlib_spectrum_renderer import MatplotlibSpectrumRen
 from giecar_seismic.ui.pyqtgraph_spectrum_renderer import PyQtGraphSpectrumRenderer
 from giecar_seismic.ui.seismic_renderer import RENDERERS
 from giecar_seismic.ui.spectrum_renderer import SpectrumRenderer, SpectrumVisibility
+from giecar_seismic.ui.window_flags import make_resizable_dialog
 
 
 def make_spectrum_renderer(name: str) -> SpectrumRenderer:
@@ -75,6 +76,7 @@ class RegionSpectrumWindow(QDialog):
         scale: SpectrumScale = SpectrumScale.LINEAR,
     ) -> None:
         super().__init__(parent)
+        make_resizable_dialog(self)
         self.setWindowTitle("Regional spectrum")
         self.setModal(False)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)

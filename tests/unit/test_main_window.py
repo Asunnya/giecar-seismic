@@ -3,6 +3,7 @@ import threading
 
 import numpy as np
 import pytest
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QGroupBox
 
 from giecar_seismic.application.filter_jobs import (
@@ -13,7 +14,12 @@ from giecar_seismic.application.seismic_viewer import FilterPreview
 from giecar_seismic.domain.dataset import SeismicDataset
 from giecar_seismic.domain.job import FilterType, Job, JobStatus
 from giecar_seismic.ui import main_window as main_window_module
-from giecar_seismic.ui.main_window import JOBS_TABLE_HEADERS, STATUS_COLUMN, MainWindow
+from giecar_seismic.ui.main_window import (
+    JOBS_TABLE_HEADERS,
+    STATUS_COLUMN,
+    JobLogDialog,
+    MainWindow,
+)
 
 N_SAMPLES = 64  # large enough for sosfiltfilt's padlen at order=4
 
@@ -889,3 +895,12 @@ def test_preview_reports_parameters_rejected_by_the_viewer_without_opening_it(
     assert window._viewer is None
     while window._history_thread is not None:
         wait_for_signal(window._history_thread.finished)
+
+
+def test_job_log_dialog_can_be_maximized_and_minimized(qapp):
+    dialog = JobLogDialog()
+    flags = dialog.windowFlags()
+
+    assert flags & Qt.WindowMaximizeButtonHint
+    assert flags & Qt.WindowMinimizeButtonHint
+    assert not flags & Qt.WindowContextHelpButtonHint

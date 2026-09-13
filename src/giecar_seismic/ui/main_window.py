@@ -42,6 +42,7 @@ from giecar_seismic.domain.job import (
     JobStatus,
 )
 from giecar_seismic.ui.filter_labels import FILTER_LABELS, FILTER_NAMES, cutoff_summary
+from giecar_seismic.ui.window_flags import make_resizable_dialog
 from giecar_seismic.ui.workers import (
     DatasetImporter,
     FilterJobWorker,
@@ -1011,6 +1012,7 @@ class JobLogDialog(QDialog):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        make_resizable_dialog(self)
         self.resize(820, 420)
         layout = QVBoxLayout(self)
         self._text = QPlainTextEdit(self)
