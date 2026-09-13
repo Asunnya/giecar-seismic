@@ -253,6 +253,51 @@ O projeto não usa Alembic. `create_schema()` cria tabelas ausentes, mas não mi
 um banco de uma versão anterior. Para uma avaliação limpa, remova ou mova
 conscientemente um banco antigo antes de iniciar a versão atual.
 
+## Releases
+
+Releases são criadas a partir de tags explícitas `vMAJOR.MINOR.PATCH` (por exemplo
+`v0.1.0` para a versão atual, `0.1.0`). Não há incremento automático de versão.
+
+Fluxo para publicar uma versão:
+
+1. Garanta que o CI de `master` está verde.
+2. Ajuste `[project].version` no `pyproject.toml`.
+3. Atualize o `uv.lock` se a mudança de metadados exigir (`uv lock`).
+4. Faça commit e push.
+5. Aguarde o CI de `master`.
+6. Crie uma tag anotada `vX.Y.Z` no commit desejado.
+7. Faça push da tag.
+8. O GitHub Actions (`.github/workflows/release.yml`) valida a tag (formato,
+   igualdade com a versão do `pyproject.toml`, commit contido em `master`,
+   `uv.lock` consistente), roda a suíte completa em Linux, Windows e macOS,
+   constrói o pacote, testa a instalação do wheel em um ambiente limpo e cria
+   a GitHub Release.
+
+Cada release contém o wheel, a distribuição de código-fonte (sdist) e um
+`SHA256SUMS`. Não são instaladores nativos para Windows, macOS ou Linux.
+
+### Instalar a partir de uma release
+
+Requer Python 3.12. Baixe o arquivo `.whl` da release desejada e instale em um
+ambiente virtual:
+
+```bash
+python -m venv giecar-env
+source giecar-env/bin/activate        # Windows: giecar-env\Scripts\activate
+pip install giecar_seismic-0.1.0-py3-none-any.whl
+giecar-seismic
+```
+
+Ou, com `uv`, sem criar o ambiente manualmente:
+
+```bash
+uv tool install giecar_seismic-0.1.0-py3-none-any.whl
+giecar-seismic
+```
+
+Para conferir o download, compare o hash com o `SHA256SUMS` da release
+(`sha256sum -c SHA256SUMS` no Linux/macOS; `Get-FileHash` no PowerShell).
+
 ## Log de execução por Job
 
 Cada job tem um único arquivo de log em `~/.giecar-seismic/logs/job_<id>.log`,
