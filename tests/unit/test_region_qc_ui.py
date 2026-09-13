@@ -163,8 +163,12 @@ def test_second_click_completes_the_region_and_starts_one_worker_off_the_gui_thr
     assert "Calculating regional spectrum" in viewer._region_label.text()
     assert viewer.renderer.last_region == (1.0, 3.0)
     assert service.regional_entered.wait(timeout=5)
-    assert len(set(service.regional_threads)) == 1
-    assert service.regional_threads[0] != threading.current_thread().name
+    # one call per click (single trace, then the region), each on a worker
+    # QThread -- never the GUI thread. Thread names are not compared across
+    # calls: every worker gets its own QThread and the OS may or may not
+    # reuse the underlying thread (it does on Linux, not on Windows).
+    assert len(service.regional_threads) == 2
+    assert threading.current_thread().name not in service.regional_threads
     # responsive meanwhile: widgets answer; a further click is queued, not
     # run concurrently and not lost
     click(viewer, 4.0)
