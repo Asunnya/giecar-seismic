@@ -256,7 +256,7 @@ conscientemente um banco antigo antes de iniciar a versão atual.
 ## Releases
 
 Releases são criadas a partir de tags explícitas `vMAJOR.MINOR.PATCH` (por exemplo
-`v0.1.0` para a versão atual, `0.1.0`). Não há incremento automático de versão.
+`v0.1.1` para a versão atual, `0.1.1`). Não há incremento automático de versão.
 
 Fluxo para publicar uma versão:
 
@@ -284,7 +284,7 @@ ambiente virtual:
 ```bash
 python -m venv giecar-env
 source giecar-env/bin/activate        # Windows: giecar-env\Scripts\activate
-pip install giecar_seismic-0.1.0-py3-none-any.whl
+pip install giecar_seismic-0.1.1-py3-none-any.whl
 giecar-seismic
 ```
 
@@ -294,14 +294,14 @@ Python 3.12 se ele não estiver instalado):
 ```bash
 uv venv --python 3.12
 source .venv/bin/activate             # Windows: .venv\Scripts\activate
-uv pip install giecar_seismic-0.1.0-py3-none-any.whl
+uv pip install giecar_seismic-0.1.1-py3-none-any.whl
 giecar-seismic
 ```
 
 Ou ainda, com `uv`, sem criar o ambiente manualmente:
 
 ```bash
-uv tool install giecar_seismic-0.1.0-py3-none-any.whl
+uv tool install giecar_seismic-0.1.1-py3-none-any.whl
 giecar-seismic
 ```
 

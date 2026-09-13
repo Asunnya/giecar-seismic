@@ -1,6 +1,6 @@
 [project]
 name = "giecar-seismic"
-version = "0.1.0"
+version = "0.1.1"
 description = "PyQt5 desktop app that applies streaming Butterworth filters to SEG-Y seismic surveys"
 readme = "README.md"
 authors = [
