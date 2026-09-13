@@ -1,5 +1,7 @@
 # GIECAR Seismic
 
+[![CI](https://github.com/Asunnya/giecar-seismic/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Asunnya/giecar-seismic/actions/workflows/ci.yml)
+
 ## Visão geral
 
 GIECAR Seismic é uma aplicação desktop em Python e PyQt5 para filtrar arquivos
@@ -300,6 +302,11 @@ estado. Na tela de histórico, o botão **View log** lê o arquivo fora da threa
 interface e o mostra em um diálogo somente leitura.
 
 ## Como testar
+
+A mesma verificação roda no GitHub Actions (`.github/workflows/ci.yml`) a cada push e
+pull request, em Linux, Windows e macOS: `ruff check`, `ruff format --check`, `mypy src`
+e a suíte completa com `pytest --cov`, usando o `uv.lock` (`uv sync --locked`) e Qt em
+modo `offscreen`. Nenhum teste depende de `data/survey.segy`.
 
 A suíte está dividida por escopo:
 

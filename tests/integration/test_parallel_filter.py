@@ -49,9 +49,7 @@ def test_spawn_process_failure_is_propagated_to_coordinator():
     sos = butterworth_sos(35.0, 4, 4.0)
 
     with (
-        ProcessPoolExecutor(
-            max_workers=2, mp_context=get_context("spawn")
-        ) as executor,
+        ProcessPoolExecutor(max_workers=2, mp_context=get_context("spawn")) as executor,
         pytest.raises(ValueError, match="length of the input vector"),
     ):
         filter_chunk_with_executor(chunk, sos, executor, parallel_workers=2)

@@ -140,9 +140,7 @@ def test_multiprocess_cancel_and_resume_matches_sequential_pipeline(tmp_path):
 
     engine = create_sqlite_engine(tmp_path / "jobs.sqlite")
     reads = []
-    service, _ = resumed_service(
-        engine, reads, chunk_size=2, parallel_workers=2
-    )
+    service, _ = resumed_service(engine, reads, chunk_size=2, parallel_workers=2)
     resumed = service.resume_filter_job(
         cancelled.id, lambda _: None, CooperativeCancelToken()
     )
@@ -170,9 +168,7 @@ def test_multiprocess_cancel_and_resume_matches_sequential_pipeline(tmp_path):
         assert resumed_file.attrs["complete"]
     engine.dispose()
     reference_engine.dispose()
-    assert {
-        child.pid for child in multiprocessing.active_children()
-    } <= children_before
+    assert {child.pid for child in multiprocessing.active_children()} <= children_before
 
 
 @pytest.mark.parametrize("sql_count", [0, 2, 3])

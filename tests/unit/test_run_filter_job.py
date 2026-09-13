@@ -341,9 +341,7 @@ def _build_service(
 
 
 @pytest.mark.parametrize("parallel_workers", [0, -1, True])
-def test_service_rejects_non_positive_parallel_worker_count(
-    dataset, parallel_workers
-):
+def test_service_rejects_non_positive_parallel_worker_count(dataset, parallel_workers):
     with pytest.raises(ValueError, match="parallel_workers must be at least 1"):
         FilterJobService(
             datasets=FakeDatasetRepository([dataset]),
@@ -432,9 +430,9 @@ def test_parallel_pool_is_reused_and_shutdown_after_subprocess_failure(
 def test_parallel_pool_is_created_once_and_reused_for_all_chunks(dataset, monkeypatch):
     from concurrent.futures import Future
 
-    traces = np.arange(
-        dataset.n_traces * dataset.n_samples, dtype=np.float32
-    ).reshape(dataset.n_traces, dataset.n_samples)
+    traces = np.arange(dataset.n_traces * dataset.n_samples, dtype=np.float32).reshape(
+        dataset.n_traces, dataset.n_samples
+    )
     reader = FakeTraceReader(traces)
     writer = FakeTraceWriter()
     pools = []
