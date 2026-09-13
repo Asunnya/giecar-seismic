@@ -288,7 +288,17 @@ pip install giecar_seismic-0.1.0-py3-none-any.whl
 giecar-seismic
 ```
 
-Ou, com `uv`, sem criar o ambiente manualmente:
+Ou, com `uv`, em um ambiente virtual gerenciado pelo próprio `uv` (que baixa o
+Python 3.12 se ele não estiver instalado):
+
+```bash
+uv venv --python 3.12
+source .venv/bin/activate             # Windows: .venv\Scripts\activate
+uv pip install giecar_seismic-0.1.0-py3-none-any.whl
+giecar-seismic
+```
+
+Ou ainda, com `uv`, sem criar o ambiente manualmente:
 
 ```bash
 uv tool install giecar_seismic-0.1.0-py3-none-any.whl
