@@ -2,7 +2,6 @@ import numpy as np
 import pytest
 
 from giecar_seismic.application.seismic_viewer import (
-    SeismicViewerService,
     SpectrumScale,
     spectrum_for_display,
 )
@@ -10,7 +9,7 @@ from giecar_seismic.domain.job import FilterType
 from giecar_seismic.ui.matplotlib_spectrum_renderer import MatplotlibSpectrumRenderer
 from giecar_seismic.ui.pyqtgraph_spectrum_renderer import PyQtGraphSpectrumRenderer
 from giecar_seismic.ui.spectrum_renderer import SpectrumVisibility
-from tests.unit.test_spectrum_science import make_view
+from tests.unit.test_spectrum_science import make_regional
 
 
 @pytest.mark.parametrize(
@@ -25,7 +24,7 @@ from tests.unit.test_spectrum_science import make_view
 def test_shared_spectrum_renderers_data_markers_axes_and_visibility(
     qapp, kind, upper, scale
 ):
-    raw = SeismicViewerService.spectrum(make_view(kind, 15, upper))
+    raw = make_regional(kind, 15, upper).spectrum
     data = spectrum_for_display(raw, scale)
     mpl, pg = MatplotlibSpectrumRenderer(), PyQtGraphSpectrumRenderer()
     try:
@@ -81,14 +80,11 @@ def test_shared_spectrum_renderers_data_markers_axes_and_visibility(
 @pytest.mark.parametrize(
     "renderer_class", [MatplotlibSpectrumRenderer, PyQtGraphSpectrumRenderer]
 )
-def test_trace_updates_reuse_items_and_dispose_is_idempotent(qapp, renderer_class):
+def test_spectrum_updates_reuse_items_and_dispose_is_idempotent(qapp, renderer_class):
     renderer = renderer_class()
-    first = spectrum_for_display(
-        SeismicViewerService.spectrum(make_view()), SpectrumScale.DB
-    )
+    first = spectrum_for_display(make_regional().spectrum, SpectrumScale.DB)
     second = spectrum_for_display(
-        SeismicViewerService.spectrum(make_view(FilterType.HIGH_PASS, n=2000)),
-        SpectrumScale.DB,
+        make_regional(FilterType.HIGH_PASS, n_traces=5).spectrum, SpectrumScale.DB
     )
     renderer.show_spectrum(first)
     item = (
@@ -108,3 +104,71 @@ def test_trace_updates_reuse_items_and_dispose_is_idempotent(qapp, renderer_clas
     renderer.dispose()
     renderer.dispose()
     assert renderer.disposed
+
+
+@pytest.mark.parametrize(
+    "renderer_class", [MatplotlibSpectrumRenderer, PyQtGraphSpectrumRenderer]
+)
+def test_waveform_panel_shows_a_single_trace_and_hides_for_regions(
+    qapp, renderer_class
+):
+    renderer = renderer_class()
+    single = make_regional(n_traces=1)
+    waveform = single.waveform
+    assert waveform is not None
+    try:
+        assert renderer.last_waveform is None
+        assert renderer.waveform_widget().isHidden()
+
+        renderer.show_waveform(waveform)
+
+        assert renderer.last_waveform is waveform
+        assert not renderer.waveform_widget().isHidden()
+        if isinstance(renderer, MatplotlibSpectrumRenderer):
+            ax = renderer.waveform_axes
+            original, filtered = ax.get_lines()[:2]
+            np.testing.assert_array_equal(original.get_xdata(), waveform.original)
+            np.testing.assert_array_equal(original.get_ydata(), waveform.time_ms)
+            np.testing.assert_array_equal(filtered.get_xdata(), waveform.filtered)
+            assert ax.get_ylim()[0] > ax.get_ylim()[1]  # time downwards
+            assert ax.get_xlim() == (
+                -waveform.amplitude_scale,
+                waveform.amplitude_scale,
+            )
+            assert ax.get_xlabel() == "Amplitude" and ax.get_ylabel() == "Time (ms)"
+        else:
+            np.testing.assert_array_equal(
+                renderer.waveform_original.getData()[0], waveform.original
+            )
+            np.testing.assert_array_equal(
+                renderer.waveform_original.getData()[1], waveform.time_ms
+            )
+            np.testing.assert_array_equal(
+                renderer.waveform_filtered.getData()[0], waveform.filtered
+            )
+            assert renderer.waveform_plot.getViewBox().yInverted()
+            assert renderer.waveform_plot.getViewBox().viewRange()[0] == [
+                -waveform.amplitude_scale,
+                waveform.amplitude_scale,
+            ]
+
+        renderer.show_waveform(None)  # a region: no time-domain curve at all
+        assert renderer.last_waveform is None
+        assert renderer.waveform_widget().isHidden()
+    finally:
+        renderer.dispose()
+
+
+def test_both_renderers_receive_the_same_waveform_arrays(qapp):
+    waveform = make_regional(n_traces=1).waveform
+    mpl, pg = MatplotlibSpectrumRenderer(), PyQtGraphSpectrumRenderer()
+    try:
+        for r in (mpl, pg):
+            r.show_waveform(waveform)
+        np.testing.assert_array_equal(
+            mpl.waveform_axes.get_lines()[0].get_xdata(),
+            pg.waveform_original.getData()[0],
+        )
+    finally:
+        mpl.dispose()
+        pg.dispose()

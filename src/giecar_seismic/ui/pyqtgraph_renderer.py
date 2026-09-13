@@ -1,17 +1,11 @@
 import time
-from collections.abc import Sequence
 
 import numpy as np
 import pyqtgraph as pg
 from PyQt5.QtCore import QRectF, Qt
 from PyQt5.QtWidgets import QVBoxLayout, QWidget
 
-from giecar_seismic.application.seismic_viewer import (
-    SeismicSection,
-    TraceSpectrum,
-    TraceView,
-)
-from giecar_seismic.ui.pyqtgraph_spectrum_renderer import PyQtGraphSpectrumRenderer
+from giecar_seismic.application.seismic_viewer import SeismicSection
 from giecar_seismic.ui.seismic_renderer import (
     DisplaySettings,
     PanelRender,
@@ -19,7 +13,6 @@ from giecar_seismic.ui.seismic_renderer import (
     amplitude_limit,
     panels_for_mode,
     section_extent,
-    trace_amplitude_scale,
     wiggle_traces,
     x_axis_label,
 )
@@ -28,7 +21,7 @@ from giecar_seismic.ui.seismic_renderer import (
 class PyQtGraphSeismicRenderer(SeismicRenderer):
     """PyQtGraph renderer: ImageItem per panel inside PlotItems of one
     GraphicsLayoutWidget (variable density), PlotCurveItems for wiggle,
-    PlotWidgets for the trace overlay and spectrum.
+    a LinearRegionItem plus two InfiniteLines per panel for the region.
 
     Same data, same clipping, same modes as the matplotlib renderer --
     all of that comes from seismic_renderer's shared helpers. Known
@@ -43,7 +36,8 @@ class PyQtGraphSeismicRenderer(SeismicRenderer):
         super().__init__()
         self.last_panels: list[PanelRender] = []
         self.last_render_seconds = 0.0
-        self.last_spectrum: TraceSpectrum | None = None
+        self.last_region: tuple[float, float] | None = None
+        self.last_region_start: float | None = None
 
         self._section_panel = QWidget()
         layout = QVBoxLayout(self._section_panel)
@@ -52,52 +46,23 @@ class PyQtGraphSeismicRenderer(SeismicRenderer):
         layout.addWidget(self._layout_widget)
         self._plots: list[pg.PlotItem] = []
         self._images: list[pg.ImageItem] = []
-        self._compare_lines: list[tuple[pg.PlotItem, pg.InfiniteLine]] = []
-        self.last_compare_markers: tuple[float, ...] = ()
+        self._region_items: list[tuple[pg.PlotItem, pg.GraphicsObject]] = []
         self._layout_widget.scene().sigMouseClicked.connect(self._on_scene_clicked)
-
-        self._analysis_panel = QWidget()
-        analysis_layout = QVBoxLayout(self._analysis_panel)
-        self._trace_plot = pg.PlotWidget(background="w")
-        self._trace_plot.invertY(True)
-        self._trace_plot.setLabel("bottom", "Amplitude")
-        self._trace_plot.setLabel("left", "Time (ms)")
-        self._trace_plot.addLegend(labelTextColor="k", brush=(255, 255, 255, 220))
-        self._trace_original = self._trace_plot.plot(
-            pen=pg.mkPen("#1f77b4"), name="original"
-        )
-        self._trace_filtered = self._trace_plot.plot(
-            pen=pg.mkPen("#ff7f0e"), name="filtered"
-        )
-        self._spectrum_renderer = PyQtGraphSpectrumRenderer()
-        # Existing debug/test access points refer to the shared renderer's items.
-        self._spectrum_plot = self._spectrum_renderer.plot
-        self._spectrum_original = self._spectrum_renderer.original_curve
-        self._spectrum_filtered = self._spectrum_renderer.filtered_curve
-        self._cutoff_lines = self._spectrum_renderer.cutoff_lines
-        self._cutoff_line = self._cutoff_lines[0]
-        self._response_curve = self._spectrum_renderer.response_curve
-        _darken_axes(self._trace_plot.getPlotItem())
-        analysis_layout.addWidget(self._trace_plot)
-        analysis_layout.addWidget(self._spectrum_renderer.widget())
-        self.cutoff_hz: float | None = None
 
     # -- SeismicRenderer ----------------------------------------------------
 
     def section_widget(self) -> QWidget:
         return self._section_panel
 
-    def analysis_widget(self) -> QWidget:
-        return self._analysis_panel
-
     def show_section(
         self, section: SeismicSection | None, settings: DisplaySettings
     ) -> None:
         started = time.perf_counter()
         self.last_panels = []
-        self._layout_widget.clear()  # drops every item, markers included
-        self._compare_lines.clear()
-        self.last_compare_markers = ()
+        self._layout_widget.clear()  # drops every item, region included
+        self._region_items.clear()
+        self.last_region = None
+        self.last_region_start = None
         self._plots, self._images = [], []
         if section is None:
             return
@@ -149,31 +114,11 @@ class PyQtGraphSeismicRenderer(SeismicRenderer):
         ]
         self.last_render_seconds = time.perf_counter() - started
 
-    def show_trace(
-        self, view: TraceView | None, spectrum: TraceSpectrum | None
-    ) -> None:
-        self.last_spectrum = spectrum
-        if view is None:
-            self._trace_original.setData([], [])
-            self._trace_filtered.setData([], [])
-            self._trace_plot.setTitle("")
-        else:
-            scale = trace_amplitude_scale(view)
-            self._trace_original.setData(view.original, view.time_ms)
-            self._trace_filtered.setData(view.filtered, view.time_ms)
-            self._trace_plot.setXRange(-scale, scale, padding=0)
-            self._trace_plot.setYRange(0.0, float(view.time_ms[-1]), padding=0)
-            self._trace_plot.setTitle(f"Trace {view.geometry.trace_index}")
-        self._spectrum_renderer.show_spectrum(spectrum)
-        self.cutoff_hz = spectrum.cutoff_hz if spectrum is not None else None
-
     def dispose(self) -> None:
-        self._spectrum_renderer.dispose()
         self._layout_widget.scene().sigMouseClicked.disconnect(self._on_scene_clicked)
         self._layout_widget.clear()
-        for widget in (self._section_panel, self._analysis_panel):
-            widget.setParent(None)  # type: ignore[call-overload]
-            widget.deleteLater()
+        self._section_panel.setParent(None)  # type: ignore[call-overload]
+        self._section_panel.deleteLater()
 
     # -- internals ---------------------------------------------------------------
 
@@ -181,37 +126,64 @@ class PyQtGraphSeismicRenderer(SeismicRenderer):
         scene_pos = getattr(event, "scenePos", lambda: None)()
         if scene_pos is None:
             return
-        modifiers = getattr(event, "modifiers", lambda: Qt.KeyboardModifier(0))()
-        compare = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
         for plot in self._plots:
             view_box = plot.getViewBox()
             if view_box.sceneBoundingRect().contains(scene_pos):
-                self._emit_click(float(view_box.mapSceneToView(scene_pos).x()), compare)
+                self.coordinate_clicked.emit(
+                    float(view_box.mapSceneToView(scene_pos).x())
+                )
                 return
 
-    def _emit_click(self, coordinate: float, compare: bool) -> None:
-        if compare:
-            self.compare_coordinate_clicked.emit(coordinate)
-        else:
-            self.coordinate_clicked.emit(coordinate)
-
-    def click_at_coordinate(self, coordinate: float, *, compare: bool = False) -> None:
-        """Programmatic equivalent of a (Ctrl-)click at x=coordinate on the
-        first panel (used by tests; goes through the same signals)."""
+    def click_at_coordinate(self, coordinate: float) -> None:
+        """Programmatic equivalent of a click at x=coordinate on the first
+        panel (used by tests; goes through the same signal)."""
         if self._plots:
-            self._emit_click(float(coordinate), compare)
+            self.coordinate_clicked.emit(float(coordinate))
 
-    def show_compare_markers(self, coordinates: Sequence[float]) -> None:
-        for plot, line in self._compare_lines:
-            plot.removeItem(line)
-        self._compare_lines.clear()
-        pen = pg.mkPen("#00a000", style=Qt.PenStyle.DashLine, width=1)
+    # -- region highlight ----------------------------------------------------------
+
+    _REGION_PEN = ("#00a000", Qt.PenStyle.DashLine)
+
+    def show_region_start(self, coordinate: float) -> None:
+        self._clear_region_items()
+        pen = pg.mkPen(self._REGION_PEN[0], style=self._REGION_PEN[1], width=1)
         for plot in self._plots:
-            for coordinate in coordinates:
-                line = pg.InfiniteLine(pos=float(coordinate), angle=90, pen=pen)
+            line = pg.InfiniteLine(pos=float(coordinate), angle=90, pen=pen)
+            line.role = "region-start"
+            plot.addItem(line)
+            self._region_items.append((plot, line))
+        self.last_region_start = float(coordinate)
+
+    def show_region(self, lower: float, upper: float) -> None:
+        self._clear_region_items()
+        lower, upper = min(lower, upper), max(lower, upper)
+        pen = pg.mkPen(self._REGION_PEN[0], style=self._REGION_PEN[1], width=1)
+        for plot in self._plots:
+            span = pg.LinearRegionItem(
+                values=(lower, upper),
+                movable=False,
+                brush=pg.mkBrush(0, 160, 0, 30),
+                pen=pg.mkPen(None),
+            )
+            span.setZValue(10)
+            plot.addItem(span)
+            self._region_items.append((plot, span))
+            for bound in (lower, upper):
+                line = pg.InfiniteLine(pos=bound, angle=90, pen=pen)
+                line.role = "region-bound"
                 plot.addItem(line)
-                self._compare_lines.append((plot, line))
-        self.last_compare_markers = tuple(float(c) for c in coordinates)
+                self._region_items.append((plot, line))
+        self.last_region = (float(lower), float(upper))
+
+    def clear_region(self) -> None:
+        self._clear_region_items()
+
+    def _clear_region_items(self) -> None:
+        for plot, item in self._region_items:
+            plot.removeItem(item)
+        self._region_items.clear()
+        self.last_region = None
+        self.last_region_start = None
 
     @staticmethod
     def _draw_wiggle(

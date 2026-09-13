@@ -4,7 +4,7 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from PyQt5.QtWidgets import QVBoxLayout
 
-from giecar_seismic.application.seismic_viewer import TraceSpectrum
+from giecar_seismic.application.seismic_viewer import TraceSpectrum, TraceWaveform
 from giecar_seismic.ui.spectrum_renderer import SpectrumRenderer, SpectrumVisibility
 
 
@@ -22,14 +22,18 @@ class MatplotlibSpectrumRenderer(SpectrumRenderer):
 
     def __init__(self, *, toolbar: bool = True) -> None:
         super().__init__()
-        layout = QVBoxLayout(self._widget)
-        layout.setContentsMargins(0, 0, 0, 0)
+        waveform_layout = QVBoxLayout(self._waveform_widget)
+        waveform_layout.setContentsMargins(0, 0, 0, 0)
+        self.waveform_figure = Figure(figsize=(4, 3), tight_layout=True)
+        self.waveform_canvas = FigureCanvasQTAgg(self.waveform_figure)
+        waveform_layout.addWidget(self.waveform_canvas)
+        self.waveform_axes = self.waveform_figure.subplots()
         self.figure = Figure(figsize=(8, 5), tight_layout=True)
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.toolbar = _SpectrumToolbar(self.canvas, self._widget) if toolbar else None
         if self.toolbar is not None:
-            layout.addWidget(self.toolbar)
-        layout.addWidget(self.canvas)
+            self._layout.addWidget(self.toolbar)
+        self._layout.addWidget(self.canvas, 1)
         self.axes = self.figure.subplots()
         self.axes.set_xlabel("Frequency (Hz)")
         self.axes.set_ylabel("Magnitude")
@@ -40,6 +44,26 @@ class MatplotlibSpectrumRenderer(SpectrumRenderer):
         self.cutoff_lines: list[Line2D] = []
         self.response_axes: Axes | None = None
         self.response_line: Line2D | None = None
+
+    def show_waveform(self, waveform: TraceWaveform | None) -> None:
+        self._record_waveform(waveform)
+        ax = self.waveform_axes
+        ax.clear()
+        if waveform is not None:
+            ax.plot(
+                waveform.original, waveform.time_ms, label="original", linewidth=0.8
+            )
+            ax.plot(
+                waveform.filtered, waveform.time_ms, label="filtered", linewidth=0.8
+            )
+            scale = waveform.amplitude_scale
+            ax.set_xlim(-scale, scale)
+            ax.set_ylim(float(waveform.time_ms[-1]), 0.0)  # time downwards
+            ax.set_xlabel("Amplitude")
+            ax.set_ylabel("Time (ms)")
+            ax.set_title(f"Trace {waveform.trace_index}")
+            ax.legend(loc="lower right", fontsize="small")
+        self.waveform_canvas.draw_idle()
 
     def show_spectrum(
         self,

@@ -1,7 +1,8 @@
-"""Renderer abstraction: Matplotlib and PyQtGraph renderers receive the very
-same section/trace/spectrum objects, agree on what they draw (shape,
-extent, coordinates, levels), and switching between them in the viewer
-is presentation-only -- no service call, no worker, no I/O, state kept.
+"""Renderer abstraction: Matplotlib and PyQtGraph section renderers receive
+the very same SeismicSection and region bounds, agree on what they draw
+(shape, extent, coordinates, levels, region), and switching between them
+in the viewer is presentation-only -- no service call, no worker, no I/O,
+viewer-owned state (section, region, regional spectrum) kept.
 """
 
 import inspect
@@ -12,13 +13,13 @@ import numpy as np
 import pytest
 
 from giecar_seismic.application.seismic_viewer import (
+    SectionRegion,
     SeismicSection,
-    TraceSpectrum,
-    TraceView,
+    SeismicViewerService,
     ViewerContext,
 )
 from giecar_seismic.domain.dataset import SeismicDataset
-from giecar_seismic.domain.geometry import LineOrientation, TraceGeometry
+from giecar_seismic.domain.geometry import LineOrientation
 from giecar_seismic.domain.job import Job, JobStatus
 from giecar_seismic.ui import matplotlib_renderer as mpl_module
 from giecar_seismic.ui import pyqtgraph_renderer as pg_module
@@ -77,32 +78,6 @@ def _section(orientation=LineOrientation.INLINE, line=10) -> SeismicSection:
     original[physical < 0] = np.nan
     filtered[physical < 0] = np.nan
     return SeismicSection(orientation, line, axis, physical, original, filtered, 4.0)
-
-
-def _view(section: SeismicSection, position: int) -> TraceView:
-    return TraceView(
-        geometry=TraceGeometry(
-            int(section.physical_trace_indices[position]),
-            section.line_number,
-            int(section.coordinates[position]),
-        ),
-        time_ms=section.time_ms,
-        original=section.original[position],
-        filtered=section.filtered[position],
-        dataset=_dataset(),
-        job=_job(),
-    )
-
-
-def _spectrum(view: TraceView) -> TraceSpectrum:
-    f = np.fft.rfftfreq(N_SAMPLES, d=0.004)
-    return TraceSpectrum(
-        f,
-        np.abs(np.fft.rfft(view.original)),
-        np.abs(np.fft.rfft(view.filtered)),
-        125.0,
-        30.0,
-    )
 
 
 SETTINGS = DisplaySettings(
@@ -261,35 +236,6 @@ def test_gain_and_clip_only_change_levels_not_data(renderer):
     assert after.shape == before.shape and after.coordinates == before.coordinates
 
 
-def test_each_renderer_shows_trace_overlay_and_spectrum_with_cutoff(renderer):
-    section = _section()
-    view = _view(section, 1)
-    spectrum = _spectrum(view)
-    renderer.show_section(section, SETTINGS)
-
-    renderer.show_trace(view, spectrum)
-
-    if isinstance(renderer, MatplotlibSeismicRenderer):
-        trace_ax = renderer.trace_figure.axes[0]
-        assert len(trace_ax.get_lines()) == 2
-        assert trace_ax.get_xlim() == (-trace_ax.get_xlim()[1], trace_ax.get_xlim()[1])
-        spectrum_ax = renderer.spectrum_figure.axes[0]
-        assert spectrum_ax.get_xlim()[1] == pytest.approx(125.0)
-        assert any(
-            "cutoff 30.0" in line.get_label() for line in spectrum_ax.get_lines()
-        )
-    else:
-        assert renderer.cutoff_hz == 30.0
-        assert renderer._cutoff_line.value() == pytest.approx(30.0)
-        assert renderer._spectrum_plot.getViewBox().viewRange()[0][1] == pytest.approx(
-            125.0
-        )
-        assert len(renderer._trace_original.xData) == N_SAMPLES
-        assert len(renderer._trace_filtered.xData) == N_SAMPLES
-
-    renderer.show_trace(None, None)  # clears without error
-
-
 def test_each_renderer_emits_the_clicked_coordinate_only(renderer):
     section = _section()
     renderer.show_section(section, SETTINGS)
@@ -302,105 +248,100 @@ def test_each_renderer_emits_the_clicked_coordinate_only(renderer):
             xdata = 2.3
 
         renderer._on_click(Event())
+        # a toolbar zoom/pan action in progress must never select a region
+        renderer._toolbar.mode = "zoom rect"
+        renderer._on_click(Event())
+        renderer._toolbar.mode = ""
     else:
         renderer.click_at_coordinate(2.3)
 
-    assert clicked == [2.3]  # resolving to a physical trace is the viewer's job
+    assert clicked == [2.3]  # resolving to an axis position is the viewer's job
+    assert not hasattr(renderer, "compare_coordinate_clicked")
 
 
-# --- comparison set: Ctrl+click and markers ------------------------------------------
+def test_section_renderers_have_no_trace_or_spectrum_presentation(renderer):
+    for name in ("show_trace", "analysis_widget", "show_compare_markers"):
+        assert not hasattr(renderer, name)
 
 
-def test_ctrl_click_emits_only_the_compare_signal(renderer):
-    renderer.show_section(_section(), SETTINGS)
-    clicked: list[float] = []
-    compared: list[float] = []
-    renderer.coordinate_clicked.connect(clicked.append)
-    renderer.compare_coordinate_clicked.connect(compared.append)
+# --- region highlight: same normalized bounds in both renderers ------------------
 
+
+def _region_artists(renderer):
+    """(spans, bound lines, start lines) drawn over every section panel."""
     if isinstance(renderer, MatplotlibSeismicRenderer):
-
-        class Plain:
-            xdata = 1.2
-
-        class Ctrl:
-            xdata = 2.3
-            key = "control"
-
-        renderer._on_click(Plain())
-        renderer._on_click(Ctrl())
-    else:
-        renderer.click_at_coordinate(1.2)
-        renderer.click_at_coordinate(2.3, compare=True)
-
-    # keyboard semantics stay inside the renderer: the viewer only sees two signals
-    assert clicked == [1.2]
-    assert compared == [2.3]
-
-
-def _marker_lines(renderer):
-    """Library-specific count of drawn comparison markers (all panels)."""
-    if isinstance(renderer, MatplotlibSeismicRenderer):
-        return [
-            line
-            for ax in renderer.section_figure.axes
-            for line in ax.lines
-            if line.get_gid() == "compare-marker"
+        artists = [
+            a for ax in renderer.section_figure.axes for a in (*ax.patches, *ax.lines)
         ]
+        return (
+            [a for a in artists if a.get_gid() == "region-span"],
+            [a for a in artists if a.get_gid() == "region-bound"],
+            [a for a in artists if a.get_gid() == "region-start"],
+        )
     import pyqtgraph as pg
 
-    return [
-        item
-        for plot in renderer.plots
-        for item in plot.items
-        if isinstance(item, pg.InfiniteLine)
-    ]
+    items = [item for plot in renderer.plots for item in plot.items]
+    lines = [i for i in items if isinstance(i, pg.InfiniteLine)]
+    return (
+        [i for i in items if isinstance(i, pg.LinearRegionItem)],
+        [i for i in lines if getattr(i, "role", None) == "region-bound"],
+        [i for i in lines if getattr(i, "role", None) == "region-start"],
+    )
 
 
 @pytest.mark.parametrize("mode", ["Original", "Side-by-side"])
-def test_compare_markers_are_drawn_per_panel_and_cleared(renderer, mode):
+def test_region_is_drawn_as_a_range_on_every_panel_and_cleared(renderer, mode):
     section = _section()
     renderer.show_section(section, replace(SETTINGS, mode=mode))
     n_panels = 2 if mode == "Side-by-side" else 1
+    assert renderer.last_region is None and renderer.last_region_start is None
 
-    renderer.show_compare_markers([1.0, 3.0])
+    renderer.show_region_start(2.0)
+    assert renderer.last_region_start == 2.0 and renderer.last_region is None
+    spans, bounds, starts = _region_artists(renderer)
+    assert (len(spans), len(bounds), len(starts)) == (0, 0, n_panels)
 
-    assert renderer.last_compare_markers == (1.0, 3.0)
-    lines = _marker_lines(renderer)
-    assert len(lines) == 2 * n_panels
-    xs = sorted(
-        {
-            float(line.get_xdata()[0])
-            if isinstance(renderer, MatplotlibSeismicRenderer)
-            else float(line.value())
-            for line in lines
+    renderer.show_region(2.0, 4.0)
+    assert renderer.last_region == (2.0, 4.0) and renderer.last_region_start is None
+    spans, bounds, starts = _region_artists(renderer)
+    assert (len(spans), len(bounds), len(starts)) == (n_panels, 2 * n_panels, 0)
+    if isinstance(renderer, MatplotlibSeismicRenderer):
+        xs = sorted({float(line.get_xdata()[0]) for line in bounds})
+        span_bounds = {
+            (round(p.get_x(), 6), round(p.get_x() + p.get_width(), 6)) for p in spans
         }
-    )
-    assert xs == [1.0, 3.0]
+        assert span_bounds == {(2.0, 4.0)}
+    else:
+        xs = sorted({float(line.value()) for line in bounds})
+        assert {tuple(s.getRegion()) for s in spans} == {(2.0, 4.0)}
+    assert xs == [2.0, 4.0]
+    # one range, not one marker per trace: region 1..4 still draws 2 bounds
+    renderer.show_region(1.0, 4.0)
+    _, bounds, _ = _region_artists(renderer)
+    assert len(bounds) == 2 * n_panels
 
-    renderer.show_compare_markers([3.0])  # selection shrank: redrawn, not appended
-    assert renderer.last_compare_markers == (3.0,)
-    assert len(_marker_lines(renderer)) == n_panels
+    renderer.clear_region()
+    assert renderer.last_region is None and renderer.last_region_start is None
+    assert _region_artists(renderer) == ([], [], [])
 
-    renderer.show_compare_markers([])
-    assert renderer.last_compare_markers == ()
-    assert _marker_lines(renderer) == []
-
-    renderer.show_compare_markers([2.0])
-    renderer.show_section(section, replace(SETTINGS, mode=mode))  # a new section
-    assert renderer.last_compare_markers == ()  # the viewer re-applies its own state
-    assert _marker_lines(renderer) == []
+    renderer.show_region(1.0, 3.0)
+    renderer.show_section(section, replace(SETTINGS, mode=mode))  # navigation
+    assert renderer.last_region is None  # the viewer re-applies its own state
+    assert _region_artists(renderer) == ([], [], [])
     renderer.show_section(None, SETTINGS)
-    assert _marker_lines(renderer) == []
+    assert _region_artists(renderer) == ([], [], [])
 
 
-def test_both_renderers_record_identical_compare_markers(qapp):
+def test_both_renderers_record_identical_region_bounds(qapp):
     mpl, pg = MatplotlibSeismicRenderer(), PyQtGraphSeismicRenderer()
     try:
         for r in (mpl, pg):
             r.show_section(_section(), SETTINGS)
-            r.show_compare_markers([2.0, 4.0])
-        assert mpl.last_compare_markers == pg.last_compare_markers == (2.0, 4.0)
+            r.show_region(3.0, 1.0)  # renderers draw what they are told, normalized
+        assert mpl.last_region == pg.last_region == (1.0, 3.0)
+        for r in (mpl, pg):
+            r.show_region_start(2.0)
+        assert mpl.last_region_start == pg.last_region_start == 2.0
     finally:
         mpl.dispose()
         pg.dispose()
@@ -412,8 +353,7 @@ def test_both_renderers_record_identical_compare_markers(qapp):
 class FakeViewerService:
     def __init__(self):
         self.load_calls: list[tuple[LineOrientation, int]] = []
-        self.select_calls = 0
-        self.spectrum_calls = 0
+        self.regional_calls = 0
         self.entered = threading.Event()
         self.release = threading.Event()
         self.release.set()
@@ -430,16 +370,11 @@ class FakeViewerService:
         assert self.release.wait(timeout=5)
         return _section(orientation, line_number)
 
-    def select_trace(self, job_id, section, coordinate):
-        self.select_calls += 1
-        position = int(np.argmin(np.abs(section.coordinates - coordinate)))
-        if section.physical_trace_indices[position] < 0:
-            return None
-        return _view(section, position)
-
-    def spectrum(self, view):
-        self.spectrum_calls += 1
-        return _spectrum(view)
+    def regional_spectrum(self, section, region, dataset, job, **kwargs):
+        self.regional_calls += 1
+        return SeismicViewerService.regional_spectrum(
+            section, region, dataset, job, **kwargs
+        )
 
 
 def _open(qapp, wait_for_signal):
@@ -452,14 +387,24 @@ def _open(qapp, wait_for_signal):
     return viewer, service
 
 
+def _select_region(viewer, wait_for_signal, first: float, second: float) -> None:
+    for coordinate in (first, second):
+        viewer.renderer.coordinate_clicked.emit(coordinate)
+        while viewer._thread is not None:  # regional spectrum worker(s)
+            wait_for_signal(viewer._thread.finished)
+
+
 def test_viewer_defaults_to_pyqtgraph_and_offers_matplotlib(qapp, wait_for_signal):
     viewer, _ = _open(qapp, wait_for_signal)
     assert viewer._renderer_combo.currentText() == "PyQtGraph"
     assert [viewer._renderer_combo.itemText(i) for i in range(2)] == RENDERERS
     assert isinstance(viewer.renderer, PyQtGraphSeismicRenderer)
+    viewer.close()
 
 
-def test_switching_renderer_keeps_state_and_does_no_io_or_worker(qapp, wait_for_signal):
+def test_switching_renderer_keeps_state_and_does_no_io_or_worker(
+    qapp, wait_for_signal, monkeypatch
+):
     viewer, service = _open(qapp, wait_for_signal)
     viewer._line_spinbox.setValue(11)
     wait_for_signal(viewer._thread.finished)
@@ -467,26 +412,27 @@ def test_switching_renderer_keeps_state_and_does_no_io_or_worker(qapp, wait_for_
     viewer._gain_spinbox.setValue(1.5)
     viewer._clip_spinbox.setValue(98.0)
     viewer._cmap_combo.setCurrentText("gray")
-    viewer.select_coordinate(2.0)  # crossline 2 on inline 11 -> physical 14
+    _select_region(viewer, wait_for_signal, 1.2, 4.0)  # inline 11: (11, 3) missing
     section_before = viewer._section
-    selected_before = viewer._selected
-    assert selected_before is not None and selected_before.geometry.trace_index == 14
-    loads, selects, spectra = (
-        len(service.load_calls),
-        service.select_calls,
-        service.spectrum_calls,
-    )
-    old_renderer = viewer.renderer
+    region_before = viewer._region
+    regional_before = viewer._regional
+    assert regional_before is not None
+    assert region_before.region == SectionRegion(1, 4)
+    loads, regionals = len(service.load_calls), service.regional_calls
+    old_renderer, old_spectrum_renderer = viewer.renderer, viewer.spectrum_renderer
 
+    def forbidden(*args, **kwargs):
+        pytest.fail("renderer switch performed science or I/O")
+
+    monkeypatch.setattr(np.fft, "rfft", forbidden)
+    monkeypatch.setattr(viewer, "_start_worker", forbidden)
     viewer._renderer_combo.setCurrentText("Matplotlib")
 
     assert isinstance(viewer.renderer, MatplotlibSeismicRenderer)
     assert viewer.renderer is not old_renderer
+    assert viewer.spectrum_renderer is not old_spectrum_renderer
     assert viewer._thread is None  # no worker started
-    assert len(service.load_calls) == loads  # no reload
-    assert (
-        service.select_calls == selects and service.spectrum_calls == spectra
-    )  # no re-resolve/FFT
+    assert len(service.load_calls) == loads and service.regional_calls == regionals
     assert viewer._section is section_before  # same object, not a copy
     assert viewer.orientation is LineOrientation.INLINE
     assert viewer._line_spinbox.value() == 11
@@ -494,25 +440,22 @@ def test_switching_renderer_keeps_state_and_does_no_io_or_worker(qapp, wait_for_
     assert viewer._gain_spinbox.value() == 1.5
     assert viewer._clip_spinbox.value() == 98.0
     assert viewer._cmap_combo.currentText() == "gray"
-    assert viewer._selected is selected_before
+    assert viewer._region is region_before and viewer._regional is regional_before
     assert viewer._renderer_combo.isEnabled() is True
-    # the new renderer drew the same section with the same settings
+    # the new renderer drew the same section, region and regional spectrum
     panel = viewer.renderer.last_panels[0]
     assert panel.title.startswith("Filtered - Original -- inline 11")
     assert panel.levels == (
         -amplitude_limit(section_before, 98.0, 1.5),
         amplitude_limit(section_before, 98.0, 1.5),
     )
-    assert any(
-        "cutoff 30.0" in line.get_label()
-        for line in viewer.renderer.spectrum_figure.axes[0].get_lines()
-    )
-    assert "Trace 14" in viewer._trace_info_label.text()
+    assert viewer.renderer.last_region == (1.0, 4.0)
+    assert viewer.spectrum_renderer.last_spectrum is viewer._display.spectrum
+    assert "XL 1–4" in viewer._region_label.text()
+    viewer.close()
 
 
-def test_trace_selection_resolves_the_same_physical_trace_in_both_renderers(
-    qapp, wait_for_signal
-):
+def test_region_resolves_identically_in_both_renderers(qapp, wait_for_signal):
     viewer, _ = _open(qapp, wait_for_signal)
     viewer._line_spinbox.setValue(11)
     wait_for_signal(viewer._thread.finished)
@@ -520,34 +463,40 @@ def test_trace_selection_resolves_the_same_physical_trace_in_both_renderers(
     results = {}
     for name in RENDERERS:
         viewer._renderer_combo.setCurrentText(name)
-        viewer.renderer.coordinate_clicked.emit(1.2)  # via the renderer's own signal
-        present = viewer._selected.geometry.trace_index
-        viewer.renderer.coordinate_clicked.emit(3.0)  # (11, 3) missing
-        missing = viewer._selected
-        results[name] = (present, missing)
+        _select_region(viewer, wait_for_signal, 3.0, 1.2)  # 3 is the gap, still a bound
+        assert viewer._regional is not None
+        results[name] = (
+            viewer._region.region,
+            viewer._region.trace_indices,
+            viewer.renderer.last_region,
+        )
 
-    assert results["Matplotlib"] == results["PyQtGraph"] == (13, None)
-    assert "No trace at this position" in viewer._trace_info_label.text()
+    assert results["Matplotlib"] == results["PyQtGraph"]
+    assert results["PyQtGraph"] == (SectionRegion(1, 3), (13, 14), (1.0, 3.0))
+    viewer.close()
 
 
 def test_switching_back_and_forth_does_not_duplicate_signal_handlers(
     qapp, wait_for_signal
 ):
-    viewer, service = _open(qapp, wait_for_signal)
+    viewer, _ = _open(qapp, wait_for_signal)
     for _ in range(3):
         viewer._renderer_combo.setCurrentText("Matplotlib")
         viewer._renderer_combo.setCurrentText("PyQtGraph")
-    before = service.select_calls
 
     viewer.renderer.coordinate_clicked.emit(1.0)
 
-    assert service.select_calls == before + 1  # exactly one handler connected
+    assert viewer._region_start == 1  # exactly one handler: still ONE boundary
+    assert viewer._region.region == SectionRegion(1, 1)
+    while viewer._thread is not None:
+        wait_for_signal(viewer._thread.finished)
     assert len(viewer._splitter.widget(0).children()) > 0
     assert viewer._splitter.count() == 2  # old section widgets were removed
-    assert viewer._analysis_slot.count() == 1
+    assert viewer._spectrum_slot.count() == 1
+    viewer.close()
 
 
-def test_closing_the_viewer_disposes_the_active_renderer(qapp, wait_for_signal):
+def test_closing_the_viewer_disposes_the_active_renderers(qapp, wait_for_signal):
     from PyQt5.QtGui import QCloseEvent
 
     viewer, _ = _open(qapp, wait_for_signal)
@@ -558,6 +507,7 @@ def test_closing_the_viewer_disposes_the_active_renderer(qapp, wait_for_signal):
 
     assert event.isAccepted() is True
     assert viewer._renderer is None
+    assert viewer._spectrum_renderer is None
 
 
 def test_pyqtgraph_renderer_uses_a_white_background_like_matplotlib(qapp):
@@ -566,7 +516,5 @@ def test_pyqtgraph_renderer_uses_a_white_background_like_matplotlib(qapp):
     renderer = PyQtGraphSeismicRenderer()
     renderer.show_section(_section(), SETTINGS)
 
-    widgets = [renderer._layout_widget, renderer._trace_plot, renderer._spectrum_plot]
-    for widget in widgets:
-        assert widget.backgroundBrush().color() == QColor("white")
+    assert renderer._layout_widget.backgroundBrush().color() == QColor("white")
     renderer.dispose()

@@ -10,13 +10,13 @@ import pytest
 
 from giecar_seismic.application.seismic_viewer import (
     FilterPreview,
+    SectionRegion,
     SeismicSection,
-    TraceSpectrum,
-    TraceView,
+    SeismicViewerService,
     ViewerContext,
 )
 from giecar_seismic.domain.dataset import SeismicDataset
-from giecar_seismic.domain.geometry import LineOrientation, TraceGeometry
+from giecar_seismic.domain.geometry import LineOrientation
 from giecar_seismic.domain.job import Job, JobStatus
 from giecar_seismic.ui import seismic_viewer as viewer_module
 from giecar_seismic.ui import viewer_workers as workers_module
@@ -91,28 +91,9 @@ class FakeViewerService:
         assert self.release.wait(timeout=5), "test deadlocked"
         return _section(orientation, line_number)
 
-    def select_trace(self, job_id, section, coordinate):
-        position = int(np.argmin(np.abs(section.coordinates - coordinate)))
-        idx = int(section.physical_trace_indices[position])
-        if idx < 0:
-            return None
-        return TraceView(
-            geometry=TraceGeometry(idx, 99, int(section.coordinates[position])),
-            time_ms=section.time_ms,
-            original=section.original[position],
-            filtered=section.filtered[position],
-            dataset=_dataset(),
-            job=_job(),
-        )
-
-    def spectrum(self, view):
-        f = np.fft.rfftfreq(N_SAMPLES, d=0.004)
-        return TraceSpectrum(
-            f,
-            np.abs(np.fft.rfft(view.original)),
-            np.abs(np.fft.rfft(view.filtered)),
-            125.0,
-            30.0,
+    def regional_spectrum(self, target, region, dataset, job, **kwargs):
+        return SeismicViewerService.regional_spectrum(
+            target, region, dataset, job, **kwargs
         )
 
 
@@ -260,43 +241,48 @@ def test_switching_orientation_loads_the_first_crossline(qapp, wait_for_signal):
     assert viewer._section.orientation is LineOrientation.CROSSLINE
 
 
-def test_selecting_a_coordinate_shows_trace_metadata_and_spectrum(
+def test_two_clicks_define_a_region_and_show_its_regional_spectrum(
     qapp, wait_for_signal
 ):
     viewer, _, _ = _open(qapp, wait_for_signal)
 
-    viewer.select_coordinate(2.2)  # nearest crossline 2
+    viewer.select_coordinate(2.2)  # nearest crossline 2 -> single trace first
+    wait_for_signal(viewer._thread.finished)
+    assert viewer.region.region == SectionRegion(2, 2)
+    viewer.select_coordinate(3.0)
+    wait_for_signal(viewer._thread.finished)
 
-    text = viewer._trace_info_label.text()
-    assert "Trace 1" in text and "crossline 2" in text
-    assert "Nyquist 125.0 Hz" in text
-    assert "cutoff 30.0 Hz" in text and "order 4" in text
-    # drawn by the default (PyQtGraph) renderer: trace curves populated,
-    # spectrum spans 0..Nyquist with the cutoff line shown
-    renderer = viewer.renderer
-    assert len(renderer._trace_original.getData()[0]) == N_SAMPLES
-    assert renderer.cutoff_hz == 30.0
-    assert renderer._cutoff_line.isVisible()
-    assert renderer._spectrum_plot.getViewBox().viewRange()[0][1] == pytest.approx(
-        125.0
-    )
+    text = viewer._region_label.text()
+    assert "Inline 10" in text and "Region: XL 2–3" in text
+    assert "2 traces present" in text and "0 missing positions" in text
+    assert viewer.region.region == SectionRegion(2, 3)
+    # drawn by the default (PyQtGraph) spectrum renderer: spectrum spans
+    # 0..Nyquist with the job's cutoff line shown; region highlighted
+    renderer = viewer.spectrum_renderer
+    assert renderer.cutoff_lines[0].isVisible()
+    assert renderer.cutoff_lines[0].value() == pytest.approx(30.0)
+    assert renderer.plot.getViewBox().viewRange()[0][1] == pytest.approx(125.0)
+    assert len(renderer.original_curve.getData()[0]) == N_SAMPLES // 2 + 1
+    assert viewer.renderer.last_region == (2.0, 3.0)
 
 
-def test_selecting_a_missing_position_reports_it_instead_of_inventing_a_trace(
+def test_a_boundary_on_a_missing_position_is_kept_and_the_gap_reported(
     qapp, wait_for_signal
 ):
     viewer, _, _ = _open(qapp, wait_for_signal)
     viewer._line_spinbox.setValue(11)
-    thread = viewer._thread
-    assert thread is not None
-    wait_for_signal(thread.finished)
+    wait_for_signal(viewer._thread.finished)
 
-    viewer.select_coordinate(3.0)  # (11, 3) missing
+    viewer.select_coordinate(3.0)  # (11, 3) missing: still a valid boundary
+    assert viewer._thread is None  # nothing to analyse yet, no worker
+    viewer.select_coordinate(1.0)
+    wait_for_signal(viewer._thread.finished)
 
-    assert viewer._selected is None
-    assert "No trace at this position" in viewer._trace_info_label.text()
-    assert len(viewer.renderer._trace_original.getData()[0] or []) == 0
-    assert viewer.renderer.cutoff_hz is None
+    assert viewer.region.region == SectionRegion(1, 3)
+    assert viewer.region.trace_indices == (3, 4)  # never a neighbour for the gap
+    text = viewer._region_label.text()
+    assert "2 traces present" in text and "1 missing position" in text
+    assert viewer.regional_spectrum.n_missing == 1
 
 
 @pytest.mark.parametrize(
@@ -427,20 +413,6 @@ class PreviewRecordingService(FakeViewerService):
         self.targets.append(target)
         return super().load_section(target, orientation, line_number)
 
-    def select_trace(self, target, section, coordinate):
-        self.targets.append(target)
-        view = super().select_trace(target, section, coordinate)
-        if view is None:
-            return None
-        return TraceView(
-            view.geometry,
-            view.time_ms,
-            view.original,
-            view.filtered,
-            view.dataset,
-            Job(dataset_id=1, cutoff_hz=25.0, order=6),
-        )
-
 
 def test_preview_target_reaches_every_service_call_and_is_labelled_as_such(
     qapp, wait_for_signal
@@ -454,6 +426,9 @@ def test_preview_target_reaches_every_service_call_and_is_labelled_as_such(
         assert thread is not None
         wait_for_signal(thread.finished)
     viewer.select_coordinate(1.0)
+    wait_for_signal(viewer._thread.finished)
+    viewer.select_coordinate(3.0)
+    wait_for_signal(viewer._thread.finished)
 
     assert "preview" in viewer.windowTitle()
     # a preview is about the raw data first: opens on the original section
@@ -461,6 +436,8 @@ def test_preview_target_reaches_every_service_call_and_is_labelled_as_such(
     assert viewer.renderer.last_panels[0].title.startswith("Original --")
     assert "job" not in viewer.windowTitle().split("--")[1].split("(")[0]
     assert all(target == preview for target in service.targets)
-    assert "Preview: Filter type" in viewer._trace_info_label.text()
-    assert "Job None" not in viewer._trace_info_label.text()
+    # the regional spectrum carries the preview's (unpersisted) parameters
+    regional = viewer.regional_spectrum
+    assert regional is not None and regional.job.id is None
+    assert [m.frequency_hz for m in regional.spectrum.cutoff_markers] == [25.0]
     viewer.close()

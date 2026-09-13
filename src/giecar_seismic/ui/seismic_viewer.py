@@ -1,33 +1,37 @@
-"""2D seismic section viewer (QC of a filter job's output, or a preview
-of filter parameters on a dataset before any job is created).
+"""2D seismic section viewer: navigation by inline/crossline plus
+REGION-oriented spectral QC of a filter job's output (or a preview).
 
 Layout: a navigation/display bar on top; below it, a splitter with the
-section view on the left and, on the right, the selected trace's
-metadata, an original-vs-filtered trace overlay and both amplitude
-spectra with the job's cutoff marked.
+section view on the left and, on the right, the compact Region QC panel:
+the region's bounds/counts, spectrum controls and the regional spectrum
+(aggregate original vs aggregate filtered).
+
+Interaction: one normal click on the section analyses that single trace
+(a region of width one); a second click extends it to the contiguous
+region between the two clicks (any order; both inclusive). Every
+physically present trace inside it contributes; gaps are excluded and
+reported. A third click starts over from a new single trace. No keyboard
+modifier, no drag.
 
 Rendering is delegated to a SeismicRenderer (PyQtGraph by default,
-Matplotlib selectable at runtime). This dialog keeps all state -- orientation, line,
-display mode, gain, clip, colormap, wiggle, selected trace and its
-spectrum -- and the worker lifecycle; a renderer only draws what it is
-handed. Switching renderer disposes the old one, builds the new one and
-redraws the section/trace/spectrum already in memory: no worker, no
-SEG-Y/HDF5 read, no repository query, no FFT.
+Matplotlib selectable at runtime) for the section and a SpectrumRenderer
+of the same family for the spectrum. This dialog keeps all state --
+orientation, line, display mode, gain, clip, colormap, wiggle, region
+boundaries, the raw regional spectrum and its display variant -- and the
+worker lifecycle; renderers only draw what they are handed. Switching
+renderer disposes the old ones, builds new ones and redraws what is
+already in memory: no worker, no SEG-Y/HDF5 read, no repository query,
+no FFT.
 
-Two selections coexist: the *active* trace (click; right-hand panel and
-the single-trace SpectrumWindow) and the *comparison set* (Ctrl+click;
-physical trace indices of the current section, capped at
-MAX_COMPARE_TRACES) whose aggregate spectrum opens in the modeless
-CompareSpectrumWindow. Both are computed from the section already in
-memory; the comparison set is cleared whenever the section changes.
-
-Threading: every load (geometry index build, section read) runs on a
-QThread via the workers in viewer_workers.py; this dialog only receives
-small value objects through signals and draws them. Navigation is
-disabled while a load is in flight -- the simplest policy that makes a
-stale result impossible. Trace selection and the spectrum are computed
-from the section already in memory (one line, no I/O), so they run on
-the GUI thread.
+Threading: every load (geometry index build, section read) and the
+regional spectrum aggregation (chunked FFTs over possibly hundreds of
+traces) run on a QThread via the workers in viewer_workers.py -- one
+worker/thread pair at a time; this dialog only receives small value
+objects through signals and draws them. Navigation and region clicks
+are disabled while a worker is in flight -- the simplest policy that
+makes a stale result impossible. Presentation changes (scale, curve
+visibility, renderer) reuse the cached regional spectrum on the GUI
+thread.
 """
 
 import logging
@@ -50,19 +54,26 @@ from PyQt5.QtWidgets import (
 )
 
 from giecar_seismic.application.seismic_viewer import (
+    MIN_REGION_TRACES,
+    RegionalSpectrum,
+    ResolvedRegion,
+    SectionRegion,
     SeismicSection,
     SeismicViewerService,
     SpectrumScale,
-    TraceSpectrum,
-    TraceView,
     ViewerTarget,
-    spectrum_for_display,
+    regional_spectrum_for_display,
 )
 from giecar_seismic.domain.geometry import LineOrientation
-from giecar_seismic.ui.compare_spectrum_window import CompareSpectrumWindow
-from giecar_seismic.ui.filter_labels import FILTER_LABELS, FILTER_NAMES, cutoff_summary
+from giecar_seismic.ui.filter_labels import FILTER_NAMES, cutoff_summary
 from giecar_seismic.ui.matplotlib_renderer import MatplotlibSeismicRenderer
 from giecar_seismic.ui.pyqtgraph_renderer import PyQtGraphSeismicRenderer
+from giecar_seismic.ui.region_spectrum_window import (
+    RegionSpectrumWindow,
+    axis_abbreviation,
+    make_spectrum_renderer,
+    region_summary,
+)
 from giecar_seismic.ui.seismic_renderer import (
     COLORMAPS,
     DISPLAY_MODES,
@@ -70,19 +81,21 @@ from giecar_seismic.ui.seismic_renderer import (
     DisplaySettings,
     SeismicRenderer,
 )
-from giecar_seismic.ui.spectrum_window import SpectrumWindow
+from giecar_seismic.ui.spectrum_renderer import SpectrumRenderer, SpectrumVisibility
 from giecar_seismic.ui.viewer_workers import (
     GeometryIndexBuilder,
     GeometryIndexWorker,
+    RegionalSpectrumWorker,
     SectionLoadWorker,
 )
 
 log = logging.getLogger(__name__)
 
-# Upper bound of the Ctrl+click comparison set: a UI/performance guardrail
-# (that many single-trace FFTs on the GUI thread, that many markers), not
-# a scientific statement about how many traces an ensemble needs.
-MAX_COMPARE_TRACES = 16
+REGION_PROMPT = (
+    "Region QC\nClick a trace on the section for its spectrum; click a second "
+    "position to analyse the region between them."
+)
+EXTEND_HINT = "Click a second boundary to extend the region."
 
 
 def make_renderer(name: str) -> SeismicRenderer:
@@ -109,18 +122,23 @@ class SeismicViewer(QDialog):
         self._context = service.context(target)  # small repository reads only
         self._line_numbers: list[int] = []
         self._section: SeismicSection | None = None
-        self._selected: TraceView | None = None
-        self._selected_spectrum: TraceSpectrum | None = None
-        self._display_spectrum: TraceSpectrum | None = None
+        # Region QC state (viewer-owned; renderers only draw it):
+        # NO_BOUNDARY -> ONE_BOUNDARY(start) -> COMPLETE(region) -> ONE_BOUNDARY...
+        self._region_start: int | None = None
+        self._region: ResolvedRegion | None = None
+        self._regional: RegionalSpectrum | None = None  # raw, linear (cached)
+        self._display: RegionalSpectrum | None = None  # scale/visibility applied
+        self._region_request_id = 0
+        self._pending_region_request: int | None = None
+        # A click while a regional worker is still running (typically the
+        # second click right after the first) is applied once that thread
+        # finishes -- never two workers at once, never a lost click.
+        self._pending_click: float | None = None
         self._renderer: SeismicRenderer | None = None
-        self._spectrum_window: SpectrumWindow | None = None
-        # Comparison set, separate from `_selected`: ordered, unique
-        # physical trace indices, all present in `_section`.
-        self._compare_indices: list[int] = []
-        self._compare_window: CompareSpectrumWindow | None = None
+        self._spectrum_renderer: SpectrumRenderer | None = None
+        self._region_window: RegionSpectrumWindow | None = None
         self._section_request_id = 0
         self._pending_section_request: int | None = None
-        self._section_was_clicked = False
         # A line requested while a thread is still winding down (e.g. the
         # first line right after the geometry index finished) starts once
         # that thread's `finished` fires -- never two threads at once.
@@ -128,7 +146,9 @@ class SeismicViewer(QDialog):
 
         # One worker/thread pair at a time, kept as attributes while alive.
         self._thread: QThread | None = None
-        self._worker: GeometryIndexWorker | SectionLoadWorker | None = None
+        self._worker: (
+            GeometryIndexWorker | SectionLoadWorker | RegionalSpectrumWorker | None
+        ) = None
 
         job = self._context.job
         subject = (
@@ -213,54 +233,53 @@ class SeismicViewer(QDialog):
 
         self._splitter = QSplitter(self)  # horizontal by default
 
-        self._trace_panel = QWidget(self._splitter)
-        trace_layout = QVBoxLayout(self._trace_panel)
-        self._trace_info_label = QLabel(
-            "Click a trace on the section.", self._trace_panel
-        )
-        self._trace_info_label.setWordWrap(True)
-        trace_layout.addWidget(self._trace_info_label)
+        self._region_panel = QWidget(self._splitter)
+        region_layout = QVBoxLayout(self._region_panel)
+        self._region_label = QLabel(REGION_PROMPT, self._region_panel)
+        self._region_label.setWordWrap(True)
+        region_layout.addWidget(self._region_label)
         spectrum_bar = QHBoxLayout()
         self._spectrum_scale_combo = QComboBox(self)
         self._spectrum_scale_combo.addItems([scale.value for scale in SpectrumScale])
         self._spectrum_scale_combo.setToolTip(
-            "dB uses the original spectrum peak as a common reference for both curves; floor -120 dB."
+            "dB uses the aggregate original peak as a common reference for both "
+            "curves; floor -120 dB. Applied after the linear regional mean."
         )
         self._spectrum_scale_combo.currentIndexChanged.connect(
             self._on_spectrum_settings_changed
         )
+        spectrum_bar.addWidget(QLabel("Spectrum scale:", self))
+        spectrum_bar.addWidget(self._spectrum_scale_combo)
+        region_layout.addLayout(spectrum_bar)
+        self._original_checkbox = QCheckBox("Aggregate original", self)
+        self._filtered_checkbox = QCheckBox("Aggregate filtered", self)
         self._response_checkbox = QCheckBox("Show filter response", self)
         self._response_checkbox.setToolTip(
             "Ideal zero-phase gain |H|² from the processing SOS, on the separate right axis."
         )
-        self._response_checkbox.toggled.connect(self._on_spectrum_settings_changed)
-        spectrum_bar.addWidget(QLabel("Spectrum scale:", self))
-        spectrum_bar.addWidget(self._spectrum_scale_combo)
-        trace_layout.addLayout(spectrum_bar)
-        trace_layout.addWidget(self._response_checkbox)
+        for checkbox in (
+            self._original_checkbox,
+            self._filtered_checkbox,
+        ):
+            checkbox.setChecked(True)
+        for checkbox in (
+            self._original_checkbox,
+            self._filtered_checkbox,
+            self._response_checkbox,
+        ):
+            checkbox.toggled.connect(self._on_spectrum_settings_changed)
+            region_layout.addWidget(checkbox)
         self._open_spectrum_button = QPushButton("Open Spectrum", self)
+        self._open_spectrum_button.setToolTip(
+            "Larger, modeless view of the current regional spectrum."
+        )
         self._open_spectrum_button.setEnabled(False)
-        self._open_spectrum_button.clicked.connect(self._open_spectrum)
-        trace_layout.addWidget(self._open_spectrum_button)
-        # Comparison set: only a count and a button, hidden until used.
-        self._compare_label = QLabel("", self)
-        self._compare_label.setToolTip(
-            f"Ctrl+click traces on the section (up to {MAX_COMPARE_TRACES}) "
-            "to compare their aggregate spectra."
-        )
-        self._compare_label.hide()
-        trace_layout.addWidget(self._compare_label)
-        self._compare_button = QPushButton("Compare Spectra", self)
-        self._compare_button.setToolTip(
-            "Mean of the selected traces' amplitude spectra, original vs filtered."
-        )
-        self._compare_button.hide()
-        self._compare_button.clicked.connect(self._open_compare)
-        trace_layout.addWidget(self._compare_button)
-        self._analysis_slot = QVBoxLayout()
-        trace_layout.addLayout(self._analysis_slot, 1)
+        self._open_spectrum_button.clicked.connect(self._open_region_window)
+        region_layout.addWidget(self._open_spectrum_button)
+        self._spectrum_slot = QVBoxLayout()
+        region_layout.addLayout(self._spectrum_slot, 1)
 
-        self._install_renderer(make_renderer(self._renderer_combo.currentText()))
+        self._install_renderer(self._renderer_combo.currentText())
         splitter = self._splitter
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
@@ -283,16 +302,15 @@ class SeismicViewer(QDialog):
         ):
             widget.setEnabled(enabled)
 
-    def _start_worker(self, worker: GeometryIndexWorker | SectionLoadWorker) -> None:
-        assert self._thread is None, "a load is already in flight"
+    def _start_worker(
+        self, worker: GeometryIndexWorker | SectionLoadWorker | RegionalSpectrumWorker
+    ) -> None:
+        assert self._thread is None, "a worker is already in flight"
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        for terminal in (
-            (worker.finished, worker.failed)
-            if isinstance(worker, GeometryIndexWorker)
-            else (worker.loaded, worker.failed)
-        ):
+        for name in worker.terminal_signal_names:
+            terminal = getattr(worker, name)
             terminal.connect(thread.quit)
             terminal.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
@@ -311,6 +329,9 @@ class SeismicViewer(QDialog):
             return
         if self._line_numbers:
             self._set_navigation_enabled(True)
+        if self._pending_click is not None:
+            click, self._pending_click = self._pending_click, None
+            self.select_coordinate(click)
 
     def _start_geometry_index(self) -> None:
         self._status_label.setText("Indexing seismic geometry...")
@@ -365,11 +386,7 @@ class SeismicViewer(QDialog):
         self._section_request_id += 1
         request_id = self._section_request_id
         self._pending_section_request = request_id
-        self._selected = None
-        self._selected_spectrum = None
-        self._display_spectrum = None
-        self._show_selected_trace()
-        self._clear_compare_selection()
+        self._clear_region()
         self._status_label.setText(f"Loading {self.orientation.value} {line_number}...")
         worker = SectionLoadWorker(
             self._service, self._target, self.orientation, line_number
@@ -390,52 +407,50 @@ class SeismicViewer(QDialog):
 
     def _on_section_loaded(self, section: SeismicSection) -> None:
         self._section = section
-        self._selected = None
-        self._selected_spectrum = None
-        self._display_spectrum = None
-        self._section_was_clicked = False
-        self._clear_compare_selection()
+        self._clear_region()
         self._status_label.setText(
             f"{section.orientation.value.capitalize()} {section.line_number}: "
             f"{section.n_present_traces} traces on a {len(section.coordinates)}-position axis, "
             f"{section.n_samples} samples"
         )
         self._redraw()
-        self._show_selected_trace()
 
     def _on_load_failed(self, message: str) -> None:
         self._pending_section_request = None
+        self._pending_region_request = None
+        self._clear_region()
         self._status_label.setText(f"Failed: {message}")
 
     # -- renderer lifecycle ------------------------------------------------------
 
-    def _install_renderer(self, renderer: SeismicRenderer) -> None:
-        """Place a renderer's widgets: section on the left of the splitter,
-        trace/spectrum under the info label on the right. Only one renderer
-        exists at a time -- the previous one is disposed first."""
+    def _install_renderer(self, name: str) -> None:
+        """Place a section renderer's widget on the left of the splitter and
+        a spectrum renderer of the same family under the region panel. Only
+        one of each exists at a time -- the previous ones are disposed."""
         if self._renderer is not None:
             self._renderer.coordinate_clicked.disconnect(self.select_coordinate)
-            self._renderer.compare_coordinate_clicked.disconnect(
-                self.toggle_compare_coordinate
-            )
             self._renderer.dispose()
+        if self._spectrum_renderer is not None:
+            self._spectrum_slot.removeWidget(self._spectrum_renderer.widget())
+            self._spectrum_renderer.dispose()
+        renderer = make_renderer(name)
         self._renderer = renderer
         renderer.coordinate_clicked.connect(self.select_coordinate)
-        renderer.compare_coordinate_clicked.connect(self.toggle_compare_coordinate)
         self._splitter.insertWidget(0, renderer.section_widget())
-        self._analysis_slot.addWidget(renderer.analysis_widget())
+        self._spectrum_renderer = make_spectrum_renderer(name)
+        self._spectrum_slot.addWidget(self._spectrum_renderer.widget())
         self._splitter.setStretchFactor(0, 3)
         self._splitter.setStretchFactor(1, 1)
 
     def _on_renderer_changed(self, _index: int) -> None:
-        # Presentation only: the section, selected trace and its spectrum
-        # are already in memory and are handed to the new renderer as-is.
+        # Presentation only: the section, region and regional spectrum are
+        # already in memory and are handed to the new renderers as-is.
         # Viewport (zoom/pan) is reset; nothing else changes.
         self._renderer_combo.setEnabled(False)
         try:
-            self._install_renderer(make_renderer(self._renderer_combo.currentText()))
+            self._install_renderer(self._renderer_combo.currentText())
             self._redraw()
-            self._show_selected_trace()
+            self._show_display()
         finally:
             self._renderer_combo.setEnabled(True)
 
@@ -443,6 +458,11 @@ class SeismicViewer(QDialog):
     def renderer(self) -> SeismicRenderer:
         assert self._renderer is not None
         return self._renderer
+
+    @property
+    def spectrum_renderer(self) -> SpectrumRenderer:
+        assert self._spectrum_renderer is not None
+        return self._spectrum_renderer
 
     # -- drawing (GUI thread, from the in-memory section only) --------------------
 
@@ -457,7 +477,7 @@ class SeismicViewer(QDialog):
 
     def _redraw(self, *_args: object) -> None:
         self.renderer.show_section(self._section, self.display_settings())
-        self.renderer.show_compare_markers(self._compare_coordinates())
+        self._draw_region()
         if self._section is not None:
             log.debug(
                 "%s rendered %s %s in %.1f ms",
@@ -467,188 +487,197 @@ class SeismicViewer(QDialog):
                 self.renderer.last_render_seconds * 1000,
             )
 
-    def select_coordinate(self, coordinate: float) -> None:
-        if self._section is None or self._thread is not None:
-            return
-        self._section_was_clicked = True
-        view = self._service.select_trace(self._target, self._section, coordinate)
-        self._selected = view
-        self._selected_spectrum = (
-            self._service.spectrum(view) if view is not None else None
-        )
-        self._on_spectrum_settings_changed()
-
-    # -- comparison set (Ctrl+click; section in memory only) --------------------
+    # -- region QC (two clicks; section in memory only) ----------------------------
 
     @property
-    def compare_indices(self) -> tuple[int, ...]:
-        return tuple(self._compare_indices)
+    def region(self) -> ResolvedRegion | None:
+        return self._region
 
-    def toggle_compare_coordinate(self, coordinate: float) -> None:
-        """Add/remove the physical trace nearest to `coordinate` in the
-        comparison set. Resolved on the in-memory section: no service,
-        geometry or repository call. Gaps and off-axis clicks are ignored."""
+    @property
+    def regional_spectrum(self) -> RegionalSpectrum | None:
+        """The cached raw (linear) regional spectrum, if computed."""
+        return self._regional
+
+    def select_coordinate(self, coordinate: float) -> None:
+        """A normal click on the section. The first click analyses that
+        single trace (region of width one) and keeps the boundary; the
+        second click completes the region between the two (either order);
+        a click after a complete region starts over. Clicks are snapped
+        to the section's axis, never to the nearest physical trace: a
+        boundary may sit on a gap. A click during the (short) regional
+        worker is queued and applied when it finishes."""
         section = self._section
-        if section is None or self._thread is not None:
+        if section is None:
+            return
+        if self._thread is not None:
+            if isinstance(self._worker, RegionalSpectrumWorker):
+                self._pending_click = coordinate
             return
         position = section.position_for_coordinate(coordinate)
         if position is None:
-            return
-        trace_index = int(section.physical_trace_indices[position])
-        if trace_index < 0:
-            return
-        limit_hit = False
-        if trace_index in self._compare_indices:
-            self._compare_indices.remove(trace_index)
-        elif len(self._compare_indices) >= MAX_COMPARE_TRACES:
-            limit_hit = True
+            return  # outside the axis
+        clicked = int(section.coordinates[position])
+        if self._region_start is None:
+            # NO_BOUNDARY or COMPLETE -> ONE_BOUNDARY(clicked): single trace
+            self._region_start = clicked
+            region = SectionRegion(clicked, clicked)
+            hint = EXTEND_HINT
         else:
-            self._compare_indices.append(trace_index)
-        self._refresh_compare_ui(limit_hit=limit_hit)
-
-    def _clear_compare_selection(self) -> None:
-        if not self._compare_indices and self._compare_window is None:
-            return
-        self._compare_indices.clear()
-        self._refresh_compare_ui()
-
-    def _compare_coordinates(self) -> list[float]:
-        section = self._section
-        if section is None or not self._compare_indices:
-            return []
-        index_to_coordinate = {
-            int(index): float(coordinate)
-            for index, coordinate in zip(
-                section.physical_trace_indices, section.coordinates, strict=True
+            region = SectionRegion.from_boundaries(self._region_start, clicked)
+            self._region_start = None
+            hint = None
+        self._region = region.resolve(section)
+        self._set_regional(None)
+        self._draw_region()
+        summary = region_summary(self._region)
+        if hint is not None:
+            summary += f"\n{hint}"
+        if not self._region.is_valid:
+            self._region_label.setText(
+                f"{summary}\nRegion must contain at least {MIN_REGION_TRACES} trace."
             )
-            if index >= 0
-        }
-        return [index_to_coordinate[i] for i in self._compare_indices]
-
-    def _refresh_compare_ui(self, *, limit_hit: bool = False) -> None:
-        count = len(self._compare_indices)
-        if count == 0:
-            self._compare_label.hide()
-        else:
-            noun = "trace" if count == 1 else "traces"
-            text = f"{count} {noun} selected"
-            if limit_hit:
-                text += f" -- Limit of {MAX_COMPARE_TRACES} traces reached"
-            self._compare_label.setText(text)
-            self._compare_label.show()
-        self._compare_button.setText(f"Compare Spectra ({count})")
-        self._compare_button.setVisible(count >= 2)
-        self._compare_button.setEnabled(count >= 2)
-        if self._renderer is not None:
-            self._renderer.show_compare_markers(self._compare_coordinates())
-        if self._compare_window is not None:
-            # The window shows the aggregate of a selection that no longer
-            # exists: empty it rather than display stale curves.
-            self._compare_window.set_aggregate(None)
-
-    def _open_compare(self) -> None:
-        section = self._section
-        if section is None or len(self._compare_indices) < 2:
             return
-        # A handful of single-trace FFTs on rows already in memory: synchronous.
-        aggregate = self._service.aggregate_spectrum(
-            section,
-            list(self._compare_indices),
-            self._context.dataset,
-            self._context.job,
+        self._region_label.setText(f"{summary}\nCalculating regional spectrum...")
+        self._region_request_id += 1
+        request_id = self._region_request_id
+        self._pending_region_request = request_id
+        worker = RegionalSpectrumWorker(
+            self._service, section, region, self._context.dataset, self._context.job
         )
-        if self._compare_window is None:
-            window = CompareSpectrumWindow(
-                aggregate, self, renderer_name=self._renderer_combo.currentText()
-            )
-            self._compare_window = window
-            window.finished.connect(self._on_compare_window_closed)
-        else:
-            self._compare_window.set_aggregate(aggregate)
-        self._compare_window.show()
-        self._compare_window.raise_()
-        self._compare_window.activateWindow()
+        worker.computed.connect(
+            lambda regional: self._accept_regional_result(request_id, regional)
+        )
+        worker.failed.connect(
+            lambda message: self._on_regional_failed(request_id, message)
+        )
+        self._start_worker(worker)
 
-    def _on_compare_window_closed(self, _result: int) -> None:
-        window = self._compare_window
-        if window is not None:
-            window.finished.disconnect(self._on_compare_window_closed)
-            self._compare_window = None
+    def _region_text(self) -> str:
+        assert self._region is not None
+        text = region_summary(self._region)
+        if self._region_start is not None:
+            text += f"\n{EXTEND_HINT}"
+        return text
+
+    def _accept_regional_result(
+        self, request_id: int, regional: RegionalSpectrum
+    ) -> None:
+        # A result for a region/section that is no longer current is dropped.
+        if request_id != self._pending_region_request or self._region is None:
+            return
+        self._pending_region_request = None
+        self._region_label.setText(self._region_text())
+        self._set_regional(regional)
+
+    def _on_regional_failed(self, request_id: int, message: str) -> None:
+        if request_id != self._pending_region_request:
+            return
+        self._pending_region_request = None
+        self._set_regional(None)
+        if self._region is not None:
+            self._region_label.setText(
+                f"{self._region_text()}\nRegional spectrum failed: {message}"
+            )
+
+    def _axis_abbreviation(self) -> str:
+        return axis_abbreviation(self.orientation)
+
+    def _clear_region(self) -> None:
+        """Section replaced/cleared or navigation requested: no boundary,
+        no region, no regional spectrum, empty window."""
+        self._region_start = None
+        self._region = None
+        self._pending_region_request = None
+        self._pending_click = None
+        self._set_regional(None)
+        self._region_label.setText(REGION_PROMPT)
+        if self._renderer is not None:
+            self._renderer.clear_region()
+
+    def _draw_region(self) -> None:
+        """Re-apply the viewer-owned region state to the section renderer."""
+        renderer = self._renderer
+        if renderer is None:
+            return
+        if self._region is not None:
+            bounds = self._region.region
+            renderer.show_region(bounds.lower_coordinate, bounds.upper_coordinate)
+        elif self._region_start is not None:
+            renderer.show_region_start(self._region_start)
+        else:
+            renderer.clear_region()
+
+    def _set_regional(self, regional: RegionalSpectrum | None) -> None:
+        self._regional = regional
+        self._refresh_spectrum()
+
+    def _spectrum_visibility(self) -> SpectrumVisibility:
+        return SpectrumVisibility(
+            self._original_checkbox.isChecked(),
+            self._filtered_checkbox.isChecked(),
+            self._response_checkbox.isChecked(),
+        )
 
     def _on_spectrum_settings_changed(self, *_args: object) -> None:
-        self._display_spectrum = (
-            spectrum_for_display(
-                self._selected_spectrum,
+        self._refresh_spectrum()
+
+    def _refresh_spectrum(self) -> None:
+        """Presentation only: transform the cached raw regional spectrum
+        (no FFT) and hand it to the spectrum renderer and the window."""
+        visibility = self._spectrum_visibility()
+        self._display = (
+            regional_spectrum_for_display(
+                self._regional,
                 SpectrumScale(self._spectrum_scale_combo.currentText()),
-                show_filter_response=self._response_checkbox.isChecked(),
+                show_filter_response=visibility.response,
             )
-            if self._selected_spectrum is not None
+            if self._regional is not None
             else None
         )
-        self._show_selected_trace()
+        self._show_display()
+        self._open_spectrum_button.setEnabled(self._regional is not None)
+        if self._region_window is not None:
+            self._region_window.set_regional(self._regional)
 
-    def _show_selected_trace(self) -> None:
-        view = self._selected
-        if view is None:
-            self._trace_info_label.setText(
-                "No trace at this position (missing in the survey footprint)."
-                if self._section is not None and self._section_was_clicked
-                else "Click a trace on the section."
+    def _show_display(self) -> None:
+        """Hand the already-transformed display spectrum to the renderer."""
+        if self._spectrum_renderer is not None:
+            self._spectrum_renderer.show_waveform(
+                self._regional.waveform if self._regional is not None else None
             )
-        else:
-            g, d, j = view.geometry, view.dataset, view.job
-            assert self._selected_spectrum is not None
-            cutoffs = ", ".join(
-                f"{marker.label} {marker.frequency_hz} Hz"
-                for marker in self._selected_spectrum.cutoff_markers
+            self._spectrum_renderer.show_spectrum(
+                self._display.spectrum if self._display is not None else None,
+                self._spectrum_visibility(),
             )
-            subject = "Preview" if self._context.preview else f"Job {j.id}"
-            self._trace_info_label.setText(
-                f"Trace {g.trace_index}  |  inline {g.inline}, crossline {g.crossline}\n"
-                f"{d.n_samples} samples @ {d.sample_rate_ms} ms  (Nyquist {d.nyquist_hz:.1f} Hz)\n"
-                f"{subject}: Filter type: {FILTER_LABELS[j.filter_type]}\n"
-                f"{cutoffs}, order {j.order}"
-            )
-        self.renderer.show_trace(view, self._display_spectrum)
-        self._open_spectrum_button.setEnabled(self._display_spectrum is not None)
-        if self._spectrum_window is not None:
-            self._spectrum_window.set_scale(
-                SpectrumScale(self._spectrum_scale_combo.currentText())
-            )
-            self._spectrum_window.set_spectrum(view, self._display_spectrum)
 
-    def _open_spectrum(self) -> None:
-        if self._selected is None or self._display_spectrum is None:
+    def _open_region_window(self) -> None:
+        if self._regional is None:
             return
-        if self._spectrum_window is None:
-            window = SpectrumWindow(
-                self._selected,
-                self._display_spectrum,
+        if self._region_window is None:
+            window = RegionSpectrumWindow(
+                self._regional,
                 self,
                 renderer_name=self._renderer_combo.currentText(),
+                scale=SpectrumScale(self._spectrum_scale_combo.currentText()),
             )
-            self._spectrum_window = window
-            window.scale_requested.connect(self._set_spectrum_scale)
-            window.finished.connect(self._on_spectrum_window_closed)
-        self._spectrum_window.show()
-        self._spectrum_window.raise_()
-        self._spectrum_window.activateWindow()
+            self._region_window = window
+            window.finished.connect(self._on_region_window_closed)
+        self._region_window.show()
+        self._region_window.raise_()
+        self._region_window.activateWindow()
 
-    def _set_spectrum_scale(self, scale: str) -> None:
-        self._spectrum_scale_combo.setCurrentText(scale)
-
-    def _on_spectrum_window_closed(self, _result: int) -> None:
-        window = self._spectrum_window
+    def _on_region_window_closed(self, _result: int) -> None:
+        window = self._region_window
         if window is not None:
-            window.scale_requested.disconnect(self._set_spectrum_scale)
-            window.finished.disconnect(self._on_spectrum_window_closed)
-            self._spectrum_window = None
+            window.finished.disconnect(self._on_region_window_closed)
+            self._region_window = None
 
     # -- shutdown ------------------------------------------------------------------
 
     def closeEvent(self, event: QCloseEvent | None) -> None:
         # Same policy as MainWindow: never destroy a running QThread. A
-        # section load is short; the user simply closes again afterwards.
+        # section load or regional aggregation is short; the user simply
+        # closes again afterwards.
         if event is None:
             return
         if self._thread is not None:
@@ -657,17 +686,15 @@ class SeismicViewer(QDialog):
             )
             event.ignore()
             return
-        if self._spectrum_window is not None:
-            self._spectrum_window.close()
-        if self._compare_window is not None:
-            self._compare_window.close()
+        if self._region_window is not None:
+            self._region_window.close()
         if self._renderer is not None:
             self._renderer.coordinate_clicked.disconnect(self.select_coordinate)
-            self._renderer.compare_coordinate_clicked.disconnect(
-                self.toggle_compare_coordinate
-            )
             self._renderer.dispose()
             self._renderer = None
+        if self._spectrum_renderer is not None:
+            self._spectrum_renderer.dispose()
+            self._spectrum_renderer = None
         event.accept()
 
     def reject(self) -> None:

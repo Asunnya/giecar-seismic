@@ -1,14 +1,13 @@
-"""Modeless multi-trace spectral QC: ONE aggregate original curve vs ONE
-aggregate filtered curve (mean of per-trace amplitude spectra) for the
-viewer's Ctrl+click comparison set.
+"""Modeless, larger view of the viewer's CURRENT regional spectrum: one
+aggregate original curve vs one aggregate filtered curve (mean of
+per-trace amplitude spectra over the selected region).
 
-Distinct from SpectrumWindow (single active trace): no TraceView is faked
-here. The window owns only presentation state -- scale, curve visibility,
-renderer -- and never acquires data or computes science: it receives an
-AggregateSpectrum from the viewer and derives every display variant with
-aggregate_for_display() (no FFT). The raw aggregate is cached until the
-owner replaces it; a selection or section change empties the window
-instead of leaving stale curves on screen.
+Presentation only. The window owns scale, curve visibility and renderer;
+it never acquires data or computes science: it receives the viewer's raw
+(linear) RegionalSpectrum and derives every display variant with
+regional_spectrum_for_display() (no FFT). When the viewer's region or
+section changes, the owner empties the window instead of leaving curves
+from another line on screen.
 """
 
 from PyQt5.QtCore import Qt
@@ -24,46 +23,65 @@ from PyQt5.QtWidgets import (
 )
 
 from giecar_seismic.application.seismic_viewer import (
-    AggregateSpectrum,
+    RegionalSpectrum,
+    ResolvedRegion,
     SpectrumScale,
-    aggregate_for_display,
+    regional_spectrum_for_display,
 )
 from giecar_seismic.domain.geometry import LineOrientation
 from giecar_seismic.ui.filter_labels import FILTER_LABELS
+from giecar_seismic.ui.matplotlib_spectrum_renderer import MatplotlibSpectrumRenderer
+from giecar_seismic.ui.pyqtgraph_spectrum_renderer import PyQtGraphSpectrumRenderer
 from giecar_seismic.ui.seismic_renderer import RENDERERS
-from giecar_seismic.ui.spectrum_renderer import SpectrumVisibility
-from giecar_seismic.ui.spectrum_window import make_spectrum_renderer
-
-# Beyond this many coordinates the identity line shows an ellipsis.
-MAX_LISTED_COORDINATES = 8
+from giecar_seismic.ui.spectrum_renderer import SpectrumRenderer, SpectrumVisibility
 
 
-def coordinates_summary(aggregate: AggregateSpectrum) -> str:
-    axis = (
-        "crosslines" if aggregate.orientation is LineOrientation.INLINE else "inlines"
+def make_spectrum_renderer(name: str) -> SpectrumRenderer:
+    if name == "Matplotlib":
+        return MatplotlibSpectrumRenderer()
+    return PyQtGraphSpectrumRenderer()
+
+
+def axis_abbreviation(orientation: LineOrientation) -> str:
+    """The axis a region spans: crosslines on an inline, inlines on a crossline."""
+    return "XL" if orientation is LineOrientation.INLINE else "IL"
+
+
+def region_summary(region: ResolvedRegion) -> str:
+    """'Inline 10020 / Region: XL 2000–2050 / 48 traces present / 3 missing
+    positions' -- the same wording in the viewer panel and this window."""
+    line = f"{region.orientation.value.capitalize()} {region.line_number}"
+    bounds = f"{region.region.lower_coordinate}–{region.region.upper_coordinate}"
+    present = "trace" if region.n_present == 1 else "traces"
+    missing = "position" if region.n_missing == 1 else "positions"
+    text = (
+        f"{line}\n"
+        f"Region: {axis_abbreviation(region.orientation)} {bounds}\n"
+        f"{region.n_present} {present} present\n"
+        f"{region.n_missing} missing {missing}"
     )
-    listed = ", ".join(str(c) for c in aggregate.coordinates[:MAX_LISTED_COORDINATES])
-    if aggregate.n_traces > MAX_LISTED_COORDINATES:
-        listed += ", …"
-    return f"{axis} {listed}"
+    if region.is_single_trace:
+        text += f"\nSingle trace (physical index {region.trace_indices[0]})"
+    return text
 
 
-class CompareSpectrumWindow(QDialog):
+class RegionSpectrumWindow(QDialog):
     def __init__(
         self,
-        aggregate: AggregateSpectrum,
+        regional: RegionalSpectrum | None,
         parent: QWidget | None = None,
         *,
         renderer_name: str = "PyQtGraph",
+        scale: SpectrumScale = SpectrumScale.LINEAR,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Compare spectra")
+        self.setWindowTitle("Regional spectrum")
         self.setModal(False)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.resize(1100, 760)
         self._disposed = False
-        self.aggregate: AggregateSpectrum | None = None  # raw, linear
-        self.display: AggregateSpectrum | None = None  # scale applied
+        self.regional: RegionalSpectrum | None = None  # raw, linear
+        self.display: RegionalSpectrum | None = None  # scale applied
 
         root = QVBoxLayout(self)
         self._method_label = QLabel(self)
@@ -75,7 +93,8 @@ class CompareSpectrumWindow(QDialog):
         root.addWidget(self._identity_label)
         bar = QHBoxLayout()
         self._scale_combo = QComboBox(self)
-        self._scale_combo.addItems([scale.value for scale in SpectrumScale])
+        self._scale_combo.addItems([s.value for s in SpectrumScale])
+        self._scale_combo.setCurrentText(scale.value)
         self._renderer_combo = QComboBox(self)
         self._renderer_combo.addItems(RENDERERS)
         self._renderer_combo.setCurrentText(renderer_name)
@@ -105,7 +124,7 @@ class CompareSpectrumWindow(QDialog):
         root.addWidget(self._metadata_label)
         self._reference_label = QLabel(
             "Per-trace |FFT| magnitudes are averaged in linear scale; dB is applied "
-            "to the aggregate (reference: aggregate original peak, floor −120 dB). "
+            "to the regional mean (reference: aggregate original peak, floor −120 dB). "
             "Filter response: one zero-phase gain from the job's design, right axis.",
             self,
         )
@@ -122,45 +141,46 @@ class CompareSpectrumWindow(QDialog):
             self._response_checkbox,
         ):
             checkbox.toggled.connect(self._redraw)
-        self.set_aggregate(aggregate)
+        self.set_regional(regional)
 
-    def set_aggregate(self, aggregate: AggregateSpectrum | None) -> None:
+    def set_regional(self, regional: RegionalSpectrum | None) -> None:
         """Called only by the owner; None empties the window (stale guard)."""
-        self.aggregate = aggregate
-        if aggregate is None:
+        self.regional = regional
+        if regional is None:
             self._method_label.setText("")
             self._identity_label.setText("")
             self._metadata_label.setText("")
         else:
-            d, j = aggregate.dataset, aggregate.job
-            n = aggregate.n_traces
-            line = f"{aggregate.orientation.value.capitalize()} {aggregate.line_number}"
-            self.setWindowTitle(f"Compare spectra — {n} traces, {line}")
+            d, j = regional.dataset, regional.job
+            region = regional.region
+            self.setWindowTitle(
+                f"Regional spectrum — {region.orientation.value} {region.line_number}, "
+                f"{axis_abbreviation(region.orientation)} "
+                f"{region.region.lower_coordinate}–{region.region.upper_coordinate}"
+            )
             self._method_label.setText(
-                f"{AggregateSpectrum.METHOD} — {n} traces "
-                f"(original vs filtered, one aggregate curve each)"
+                "Single-trace amplitude spectrum (original vs filtered)"
+                if region.is_single_trace
+                else f"{RegionalSpectrum.METHOD} — {regional.n_present} traces "
+                "(original vs filtered, one aggregate curve each)"
             )
-            self._identity_label.setText(
-                f"{line}  |  {coordinates_summary(aggregate)}\n"
-                f"Physical trace indices: "
-                + ", ".join(
-                    str(i) for i in aggregate.trace_indices[:MAX_LISTED_COORDINATES]
-                )
-                + (", …" if n > MAX_LISTED_COORDINATES else "")
-            )
+            self._identity_label.setText(region_summary(region))
             cutoffs = "  |  ".join(
                 f"{m.label}: {m.frequency_hz:g} Hz"
-                for m in aggregate.spectrum.cutoff_markers
+                for m in regional.spectrum.cutoff_markers
             )
             self._metadata_label.setText(
                 f"Dataset: {d.name}  |  Filter type: {FILTER_LABELS[j.filter_type]}\n"
                 f"{cutoffs}  |  Order: {j.order}  |  Sample rate: {d.sample_rate_ms} ms"
-                f"  |  Nyquist: {aggregate.spectrum.nyquist_hz:g} Hz"
+                f"  |  Nyquist: {regional.spectrum.nyquist_hz:g} Hz"
             )
         self._response_checkbox.setEnabled(
-            aggregate is not None and aggregate.spectrum.filter_response is not None
+            regional is not None and regional.spectrum.filter_response is not None
         )
         self._redraw()
+
+    def set_scale(self, scale: SpectrumScale) -> None:
+        self._scale_combo.setCurrentText(scale.value)
 
     def _redraw(self, *_args: object) -> None:
         visibility = SpectrumVisibility(
@@ -168,14 +188,14 @@ class CompareSpectrumWindow(QDialog):
             self._filtered_checkbox.isChecked(),
             self._response_checkbox.isChecked() and self._response_checkbox.isEnabled(),
         )
-        if self.aggregate is None:
+        if self.regional is None:
             self.display = None
             self._status_label.setText(
-                "Selection changed — press Compare Spectra in the viewer again."
+                "No regional spectrum — select a region on the section."
             )
         else:
-            self.display = aggregate_for_display(
-                self.aggregate,
+            self.display = regional_spectrum_for_display(
+                self.regional,
                 SpectrumScale(self._scale_combo.currentText()),
                 show_filter_response=visibility.response,
             )
@@ -184,6 +204,9 @@ class CompareSpectrumWindow(QDialog):
                 if visibility.empty
                 else ""
             )
+        self.renderer.show_waveform(
+            self.regional.waveform if self.regional is not None else None
+        )
         self.renderer.show_spectrum(
             self.display.spectrum if self.display is not None else None, visibility
         )
@@ -199,7 +222,7 @@ class CompareSpectrumWindow(QDialog):
         if not self._disposed:
             self._disposed = True
             self.renderer.dispose()
-            self.aggregate = None
+            self.regional = None
             self.display = None
         super().done(result)
 

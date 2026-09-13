@@ -1,7 +1,7 @@
 import pyqtgraph as pg
 from PyQt5.QtWidgets import QVBoxLayout
 
-from giecar_seismic.application.seismic_viewer import TraceSpectrum
+from giecar_seismic.application.seismic_viewer import TraceSpectrum, TraceWaveform
 from giecar_seismic.ui.spectrum_renderer import SpectrumRenderer, SpectrumVisibility
 
 
@@ -10,10 +10,22 @@ class PyQtGraphSpectrumRenderer(SpectrumRenderer):
 
     def __init__(self) -> None:
         super().__init__()
-        layout = QVBoxLayout(self._widget)
-        layout.setContentsMargins(0, 0, 0, 0)
+        waveform_layout = QVBoxLayout(self._waveform_widget)
+        waveform_layout.setContentsMargins(0, 0, 0, 0)
+        self.waveform_plot = pg.PlotWidget(background="w")
+        self.waveform_plot.invertY(True)  # time increases downwards
+        self.waveform_plot.setLabel("bottom", "Amplitude")
+        self.waveform_plot.setLabel("left", "Time (ms)")
+        self.waveform_plot.addLegend(labelTextColor="k", brush=(255, 255, 255, 220))
+        self.waveform_original = self.waveform_plot.plot(
+            pen=pg.mkPen("#1f77b4"), name="original"
+        )
+        self.waveform_filtered = self.waveform_plot.plot(
+            pen=pg.mkPen("#ff7f0e"), name="filtered"
+        )
+        waveform_layout.addWidget(self.waveform_plot)
         self.plot = pg.PlotWidget(background="w")
-        layout.addWidget(self.plot)
+        self._layout.addWidget(self.plot, 1)
         self.plot.setLabel("bottom", "Frequency (Hz)")
         self.plot.setLabel("left", "Magnitude")
         self.plot.setTitle("Amplitude spectrum", color="k")
@@ -34,9 +46,10 @@ class PyQtGraphSpectrumRenderer(SpectrumRenderer):
             self.plot.addItem(line)
             line.hide()
         plot_item = self.plot.getPlotItem()
-        for side in ("left", "bottom"):
-            plot_item.getAxis(side).setPen(pg.mkPen("k"))
-            plot_item.getAxis(side).setTextPen(pg.mkPen("k"))
+        for item in (plot_item, self.waveform_plot.getPlotItem()):
+            for side in ("left", "bottom"):
+                item.getAxis(side).setPen(pg.mkPen("k"))
+                item.getAxis(side).setTextPen(pg.mkPen("k"))
         self.response_view = pg.ViewBox()
         plot_item.scene().addItem(self.response_view)
         plot_item.getAxis("right").linkToView(self.response_view)
@@ -50,6 +63,20 @@ class PyQtGraphSpectrumRenderer(SpectrumRenderer):
         self.response_view.hide()
         self.response_curve.hide()
         self._response_in_legend = False
+
+    def show_waveform(self, waveform: TraceWaveform | None) -> None:
+        self._record_waveform(waveform)
+        if waveform is None:
+            self.waveform_original.setData([], [])
+            self.waveform_filtered.setData([], [])
+            self.waveform_plot.setTitle("")
+            return
+        scale = waveform.amplitude_scale
+        self.waveform_original.setData(waveform.original, waveform.time_ms)
+        self.waveform_filtered.setData(waveform.filtered, waveform.time_ms)
+        self.waveform_plot.setXRange(-scale, scale, padding=0)
+        self.waveform_plot.setYRange(0.0, float(waveform.time_ms[-1]), padding=0)
+        self.waveform_plot.setTitle(f"Trace {waveform.trace_index}", color="k")
 
     def show_spectrum(
         self,

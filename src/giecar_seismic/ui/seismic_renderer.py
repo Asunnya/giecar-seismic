@@ -1,14 +1,15 @@
-"""Renderer contract for the 2D seismic viewer, plus the display helpers
-both renderers share so they can never disagree on *what* is drawn.
+"""Section renderer contract for the 2D seismic viewer, plus the display
+helpers both renderers share so they can never disagree on *what* is drawn.
 
 The viewer owns state (orientation, line, mode, gain, clip, colormap,
-wiggle, selected trace, workers); a renderer owns only widgets and how
-the already-loaded SeismicSection / TraceView / TraceSpectrum are drawn.
-Renderers never read SEG-Y/HDF5, never query a repository and never run
-off the GUI thread. Switching renderer therefore never touches data.
+wiggle, region, regional spectrum, workers); a section renderer owns only
+widgets and how the already-loaded SeismicSection and the viewer's region
+bounds are drawn. Renderers never read SEG-Y/HDF5, never query a
+repository, never compute science and never run off the GUI thread.
+Switching renderer therefore never touches data. Spectra are drawn by the
+separate SpectrumRenderer family (spectrum_renderer.py).
 """
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from math import ceil
 
@@ -16,11 +17,7 @@ import numpy as np
 from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtWidgets import QWidget
 
-from giecar_seismic.application.seismic_viewer import (
-    SeismicSection,
-    TraceSpectrum,
-    TraceView,
-)
+from giecar_seismic.application.seismic_viewer import SeismicSection
 from giecar_seismic.domain.geometry import LineOrientation
 
 DISPLAY_MODES = ["Original", "Filtered", "Difference", "Side-by-side"]
@@ -66,18 +63,10 @@ class SeismicRenderer(QObject):
 
     # Geometric x coordinate the user clicked on the section (crossline
     # number in inline view, inline number in crossline view). Resolving
-    # it to a physical trace stays in the viewer/service, never here.
+    # it to an axis position / region boundary stays in the viewer.
     coordinate_clicked = pyqtSignal(float)
-    # Same coordinate, Ctrl-modified: toggle the trace in the viewer's
-    # comparison set. Each renderer maps its own library's modifier
-    # semantics onto this signal, so nothing keyboard-specific leaves it.
-    compare_coordinate_clicked = pyqtSignal(float)
 
     def section_widget(self) -> QWidget:
-        raise NotImplementedError
-
-    def analysis_widget(self) -> QWidget:
-        """Trace overlay + amplitude spectrum, stacked."""
         raise NotImplementedError
 
     def show_section(
@@ -85,15 +74,18 @@ class SeismicRenderer(QObject):
     ) -> None:
         raise NotImplementedError
 
-    def show_trace(
-        self, view: TraceView | None, spectrum: TraceSpectrum | None
-    ) -> None:
+    # Region highlight: the viewer owns the region and re-applies it after
+    # every show_section() (which clears it). Bounds arrive normalized as
+    # axis coordinates; a range (span + two bound lines), never a marker
+    # per trace.
+    def show_region_start(self, coordinate: float) -> None:
+        """One boundary chosen, the second still pending."""
         raise NotImplementedError
 
-    def show_compare_markers(self, coordinates: Sequence[float]) -> None:
-        """Mark the comparison-selected coordinates on every section panel
-        (lightweight vertical lines). The viewer owns the selection and
-        re-applies it after each show_section(), which clears markers."""
+    def show_region(self, lower: float, upper: float) -> None:
+        raise NotImplementedError
+
+    def clear_region(self) -> None:
         raise NotImplementedError
 
     def dispose(self) -> None:
@@ -102,10 +94,10 @@ class SeismicRenderer(QObject):
 
     # Filled in by implementations after each show_section(); exposed for
     # tests and for the manual rendering-time measurement.
-    last_spectrum: TraceSpectrum | None
     last_panels: list[PanelRender]
     last_render_seconds: float
-    last_compare_markers: tuple[float, ...]
+    last_region: tuple[float, float] | None
+    last_region_start: float | None
 
 
 # --- shared display math ----------------------------------------------------
@@ -194,10 +186,3 @@ def wiggle_traces(
         (float(section.coordinates[p]), np.clip(data[p], -limit, limit) * scale)
         for p in present[::stride]
     ]
-
-
-def trace_amplitude_scale(view: TraceView) -> float:
-    """One symmetric amplitude scale for the original/filtered overlay."""
-    return float(
-        np.nanmax(np.abs(np.concatenate([view.original, view.filtered]))) or 1.0
-    )

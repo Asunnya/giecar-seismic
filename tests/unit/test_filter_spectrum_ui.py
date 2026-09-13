@@ -1,17 +1,10 @@
-from dataclasses import replace
-
 import numpy as np
 import pytest
 
-from giecar_seismic.application.seismic_viewer import (
-    SeismicViewerService,
-    SpectrumScale,
-    spectrum_for_display,
-)
+from giecar_seismic.application.seismic_viewer import ViewerContext
 from giecar_seismic.domain.job import FilterType, Job
 from giecar_seismic.ui.main_window import JOBS_TABLE_HEADERS, MainWindow
-from giecar_seismic.ui.matplotlib_renderer import MatplotlibSeismicRenderer
-from giecar_seismic.ui.pyqtgraph_renderer import PyQtGraphSeismicRenderer
+from giecar_seismic.ui.seismic_viewer import SeismicViewer
 from tests.unit.test_main_window import (
     FakeTraceReader,
     FakeTraceWriter,
@@ -19,8 +12,7 @@ from tests.unit.test_main_window import (
     _dataset,
     _wait_settled,
 )
-from tests.unit.test_seismic_renderers import _open
-from tests.unit.test_spectrum_science import make_view
+from tests.unit.test_seismic_renderers import FakeViewerService
 
 
 @pytest.mark.parametrize(
@@ -103,113 +95,54 @@ def test_main_window_creates_configured_job_and_history(
         window.close()
 
 
-@pytest.mark.parametrize(
-    "kind,upper",
-    [
-        (FilterType.LOW_PASS, None),
-        (FilterType.HIGH_PASS, None),
-        (FilterType.BAND_PASS, 50),
-    ],
-)
-@pytest.mark.parametrize("scale", list(SpectrumScale))
-def test_renderers_draw_identical_scientific_data(qapp, kind, upper, scale):
-    view = make_view(kind, 15, upper)
-    data = spectrum_for_display(
-        SeismicViewerService.spectrum(view), scale, show_filter_response=True
-    )
-    mpl, pg = MatplotlibSeismicRenderer(), PyQtGraphSeismicRenderer()
-    try:
-        for renderer in (mpl, pg):
-            renderer.show_trace(view, data)
-            assert renderer.last_spectrum is data
-        ax = mpl.spectrum_figure.axes[0]
-        assert ax.get_xscale() == "linear"
-        assert ax.get_xlim() == (0, 125)
-        assert ax.get_ylabel() == data.magnitude_label
-        np.testing.assert_array_equal(ax.lines[0].get_ydata(), data.original)
-        np.testing.assert_array_equal(ax.lines[1].get_ydata(), data.filtered)
-        markers = ax.lines[2:]
-        assert len(markers) == len(data.cutoff_markers)
-        for line, marker in zip(markers, data.cutoff_markers, strict=True):
-            assert line.get_xdata()[0] == marker.frequency_hz
-            assert marker.label in line.get_label()
-        response_ax = mpl.spectrum_figure.axes[1]
-        np.testing.assert_array_equal(
-            response_ax.lines[0].get_ydata(), data.filter_response
-        )
-        assert response_ax.get_ylabel() == data.response_label
-        np.testing.assert_array_equal(pg._spectrum_original.getData()[1], data.original)
-        np.testing.assert_array_equal(pg._spectrum_filtered.getData()[1], data.filtered)
-        np.testing.assert_array_equal(
-            pg._response_curve.getData()[1], data.filter_response
-        )
-        visible = [line for line in pg._cutoff_lines if line.isVisible()]
-        assert [line.value() for line in visible] == [
-            m.frequency_hz for m in data.cutoff_markers
-        ]
-        for line, marker in zip(visible, data.cutoff_markers, strict=True):
-            assert (
-                line.label.toPlainText() == f"{marker.label} {marker.frequency_hz} Hz"
-            )
-        assert pg._spectrum_plot.getAxis("left").labelText == data.magnitude_label
-        assert pg._spectrum_plot.getViewBox().viewRange()[0] == [0, 125]
-        assert not pg._spectrum_plot.getPlotItem().ctrl.logXCheck.isChecked()
-        for renderer in (mpl, pg):
-            renderer.show_trace(
-                view, spectrum_for_display(SeismicViewerService.spectrum(view), scale)
-            )
-        assert len(mpl.spectrum_figure.axes) == 1
-        assert not pg._response_curve.isVisible()
-        mpl.show_trace(None, None)
-        pg.show_trace(None, None)
-        assert not any(line.isVisible() for line in pg._cutoff_lines)
-    finally:
-        mpl.dispose()
-        pg.dispose()
-
-
-def test_scale_response_and_renderer_toggles_use_cached_spectrum(
+def test_region_qc_shows_the_jobs_filter_type_and_cutoffs_and_toggles_use_cache(
     qapp, wait_for_signal, monkeypatch
 ):
-    viewer, service = _open(qapp, wait_for_signal)
+    # The persisted job returned with the viewer context is authoritative
+    # for the cutoff markers of the regional spectrum.
+    band = Job(1, 10, 4, filter_type=FilterType.BAND_PASS, upper_cutoff_hz=40)
+
+    class BandService(FakeViewerService):
+        def context(self, target):
+            return ViewerContext(dataset=_dataset(), job=band)
+
+    service = BandService()
+    viewer = SeismicViewer(service, lambda d: True, target=7)
+    for _ in range(2):
+        wait_for_signal(viewer._thread.finished)
     try:
-        # The persisted job returned with the trace is authoritative.
-        select = service.select_trace
-
-        def select_band(*args):
-            view = select(*args)
-            return replace(
-                view,
-                job=Job(1, 10, 4, filter_type=FilterType.BAND_PASS, upper_cutoff_hz=40),
-            )
-
-        monkeypatch.setattr(service, "select_trace", select_band)
-        monkeypatch.setattr(service, "spectrum", SeismicViewerService.spectrum)
-        viewer.select_coordinate(2)
-        text = viewer._trace_info_label.text()
-        assert (
-            "Band-pass" in text and "Low cutoff 10" in text and "High cutoff 40" in text
-        )
-        raw = viewer._selected_spectrum
+        assert "Band-pass" in viewer.windowTitle()
+        for coordinate in (1.0, 4.0):
+            viewer.renderer.click_at_coordinate(coordinate)
+            while viewer._thread is not None:
+                wait_for_signal(viewer._thread.finished)
+        raw = viewer.regional_spectrum
+        assert raw is not None and raw.job is band
+        markers = viewer.spectrum_renderer.last_spectrum.cutoff_markers
+        assert [(m.label, m.frequency_hz) for m in markers] == [
+            ("Low cutoff", 10.0),
+            ("High cutoff", 40.0),
+        ]
+        viewer._open_spectrum_button.click()
+        assert "Band-pass" in viewer._region_window._metadata_label.text()
 
         def forbidden(*args, **kwargs):
             pytest.fail("presentation change performed scientific computation or I/O")
 
-        for name in ("context", "load_section", "select_trace", "spectrum"):
+        for name in ("context", "load_section", "regional_spectrum"):
             monkeypatch.setattr(service, name, forbidden)
         monkeypatch.setattr(np.fft, "rfft", forbidden)
         monkeypatch.setattr(viewer, "_start_worker", forbidden)
         for scale in ("dB", "Linear", "dB"):
             viewer._spectrum_scale_combo.setCurrentText(scale)
             viewer._response_checkbox.setChecked(True)
-            displayed = viewer.renderer.last_spectrum
+            displayed = viewer.spectrum_renderer.last_spectrum
             assert displayed.scale.value == scale
             assert displayed.show_filter_response
             viewer._renderer_combo.setCurrentText("Matplotlib")
-            assert viewer.renderer.last_spectrum is displayed
+            assert viewer.spectrum_renderer.last_spectrum is displayed
+            assert viewer._region_window.regional is raw
             viewer._renderer_combo.setCurrentText("PyQtGraph")
-            assert viewer.renderer.last_spectrum is displayed
-            assert viewer._selected_spectrum is raw
-            assert viewer._thread is None
+        assert viewer.regional_spectrum is raw
     finally:
         viewer.close()

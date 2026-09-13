@@ -1,19 +1,13 @@
 import time
-from collections.abc import Sequence
 
 import numpy as np
+from matplotlib.artist import Artist
 from matplotlib.axes import Axes
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from matplotlib.lines import Line2D
 from PyQt5.QtWidgets import QVBoxLayout, QWidget
 
-from giecar_seismic.application.seismic_viewer import (
-    SeismicSection,
-    TraceSpectrum,
-    TraceView,
-)
-from giecar_seismic.ui.matplotlib_spectrum_renderer import MatplotlibSpectrumRenderer
+from giecar_seismic.application.seismic_viewer import SeismicSection
 from giecar_seismic.ui.seismic_renderer import (
     DisplaySettings,
     PanelRender,
@@ -21,7 +15,6 @@ from giecar_seismic.ui.seismic_renderer import (
     amplitude_limit,
     panels_for_mode,
     section_extent,
-    trace_amplitude_scale,
     wiggle_traces,
     x_axis_label,
 )
@@ -38,7 +31,6 @@ class MatplotlibSeismicRenderer(SeismicRenderer):
         super().__init__()
         self.last_panels: list[PanelRender] = []
         self.last_render_seconds = 0.0
-        self.last_spectrum: TraceSpectrum | None = None
 
         self._section_panel = QWidget()
         layout = QVBoxLayout(self._section_panel)
@@ -51,35 +43,23 @@ class MatplotlibSeismicRenderer(SeismicRenderer):
         layout.addWidget(self._toolbar)
         layout.addWidget(self._section_canvas)
 
-        self._analysis_panel = QWidget()
-        analysis_layout = QVBoxLayout(self._analysis_panel)
-        self._trace_figure = Figure(figsize=(4, 3), tight_layout=True)
-        self._trace_canvas = FigureCanvasQTAgg(self._trace_figure)
-        self._spectrum_renderer = MatplotlibSpectrumRenderer(toolbar=False)
-        self._spectrum_figure = self._spectrum_renderer.figure
-        self._spectrum_canvas = self._spectrum_renderer.canvas
-        analysis_layout.addWidget(self._trace_canvas)
-        analysis_layout.addWidget(self._spectrum_renderer.widget())
-
         self._images: list = []  # reusable imshow artists, one per panel
         self._images_key: tuple[int, str] | None = None  # (n_panels, cmap)
-        self._compare_lines: list[Line2D] = []
-        self.last_compare_markers: tuple[float, ...] = ()
+        self._region_artists: list[Artist] = []
+        self.last_region: tuple[float, float] | None = None
+        self.last_region_start: float | None = None
 
     # -- SeismicRenderer ----------------------------------------------------
 
     def section_widget(self) -> QWidget:
         return self._section_panel
 
-    def analysis_widget(self) -> QWidget:
-        return self._analysis_panel
-
     def show_section(
         self, section: SeismicSection | None, settings: DisplaySettings
     ) -> None:
         started = time.perf_counter()
         self.last_panels = []
-        self._clear_compare_markers()
+        self._clear_region_artists()
         if section is None:
             self._section_figure.clear()
             self._images, self._images_key = [], None
@@ -141,31 +121,10 @@ class MatplotlibSeismicRenderer(SeismicRenderer):
         self._section_canvas.draw_idle()
         self.last_render_seconds = time.perf_counter() - started
 
-    def show_trace(
-        self, view: TraceView | None, spectrum: TraceSpectrum | None
-    ) -> None:
-        self.last_spectrum = spectrum
-        self._trace_figure.clear()
-        if view is not None:
-            ax = self._trace_figure.subplots()
-            ax.plot(view.original, view.time_ms, label="original", linewidth=0.8)
-            ax.plot(view.filtered, view.time_ms, label="filtered", linewidth=0.8)
-            scale = trace_amplitude_scale(view)
-            ax.set_xlim(-scale, scale)
-            ax.set_ylim(float(view.time_ms[-1]), 0.0)
-            ax.set_xlabel("Amplitude")
-            ax.set_ylabel("Time (ms)")
-            ax.set_title(f"Trace {view.geometry.trace_index}")
-            ax.legend(loc="lower right", fontsize="small")
-        self._spectrum_renderer.show_spectrum(spectrum)
-        self._trace_canvas.draw_idle()
-
     def dispose(self) -> None:
-        self._spectrum_renderer.dispose()
         self._section_canvas.mpl_disconnect(self._click_cid)
-        for widget in (self._section_panel, self._analysis_panel):
-            widget.setParent(None)  # type: ignore[call-overload]
-            widget.deleteLater()
+        self._section_panel.setParent(None)  # type: ignore[call-overload]
+        self._section_panel.deleteLater()
 
     # -- internals ---------------------------------------------------------------
 
@@ -174,38 +133,48 @@ class MatplotlibSeismicRenderer(SeismicRenderer):
         xdata = getattr(event, "xdata", None)
         if xdata is None or self._toolbar.mode:
             return
-        # matplotlib reports the held modifier as the event's `key`
-        if getattr(event, "key", None) == "control":
-            self.compare_coordinate_clicked.emit(float(xdata))
-            return
         self.coordinate_clicked.emit(float(xdata))
 
-    def click_at_coordinate(self, coordinate: float, *, compare: bool = False) -> None:
-        """Programmatic equivalent of a (Ctrl-)click at x=coordinate (used
-        by tests; goes through the same signals as _on_click)."""
-        if compare:
-            self.compare_coordinate_clicked.emit(float(coordinate))
-        else:
-            self.coordinate_clicked.emit(float(coordinate))
+    def click_at_coordinate(self, coordinate: float) -> None:
+        """Programmatic equivalent of a click at x=coordinate (tests)."""
+        self.coordinate_clicked.emit(float(coordinate))
 
-    def show_compare_markers(self, coordinates: Sequence[float]) -> None:
-        self._clear_compare_markers()
+    # -- region highlight ----------------------------------------------------------
+
+    def show_region_start(self, coordinate: float) -> None:
+        self._clear_region_artists()
         for ax in self._section_figure.axes:
-            for coordinate in coordinates:
-                line = ax.axvline(
-                    coordinate, color="#00a000", linestyle="--", linewidth=0.8
-                )
-                line.set_gid("compare-marker")
-                self._compare_lines.append(line)
-        self.last_compare_markers = tuple(float(c) for c in coordinates)
+            line = ax.axvline(coordinate, color="#00a000", linestyle="--", linewidth=1)
+            line.set_gid("region-start")
+            self._region_artists.append(line)
+        self.last_region_start = float(coordinate)
         self._section_canvas.draw_idle()
 
-    def _clear_compare_markers(self) -> None:
-        for line in self._compare_lines:
-            if line.axes is not None:  # figure.clear() may have removed it
-                line.remove()
-        self._compare_lines.clear()
-        self.last_compare_markers = ()
+    def show_region(self, lower: float, upper: float) -> None:
+        self._clear_region_artists()
+        lower, upper = min(lower, upper), max(lower, upper)
+        for ax in self._section_figure.axes:
+            span = ax.axvspan(lower, upper, color="#00a000", alpha=0.12, linewidth=0)
+            span.set_gid("region-span")
+            self._region_artists.append(span)
+            for bound in (lower, upper):
+                line = ax.axvline(bound, color="#00a000", linestyle="--", linewidth=1)
+                line.set_gid("region-bound")
+                self._region_artists.append(line)
+        self.last_region = (float(lower), float(upper))
+        self._section_canvas.draw_idle()
+
+    def clear_region(self) -> None:
+        self._clear_region_artists()
+        self._section_canvas.draw_idle()
+
+    def _clear_region_artists(self) -> None:
+        for artist in self._region_artists:
+            if artist.axes is not None:  # figure.clear() may have removed it
+                artist.remove()
+        self._region_artists.clear()
+        self.last_region = None
+        self.last_region_start = None
 
     @staticmethod
     def _draw_wiggle(
@@ -232,11 +201,3 @@ class MatplotlibSeismicRenderer(SeismicRenderer):
     @property
     def section_figure(self) -> Figure:
         return self._section_figure
-
-    @property
-    def trace_figure(self) -> Figure:
-        return self._trace_figure
-
-    @property
-    def spectrum_figure(self) -> Figure:
-        return self._spectrum_figure

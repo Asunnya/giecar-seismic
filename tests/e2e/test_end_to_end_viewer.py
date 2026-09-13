@@ -21,6 +21,7 @@ from giecar_seismic.application.filter_jobs import (
 from giecar_seismic.application.geometry_index import BuildGeometryIndexUseCase
 from giecar_seismic.application.seismic_viewer import (
     FilterPreview,
+    SectionRegion,
     SeismicViewerService,
 )
 from giecar_seismic.domain.geometry import LineOrientation
@@ -177,7 +178,8 @@ def test_viewer_end_to_end(world):
                 section.time_ms, np.arange(N_SAMPLES) * DT_US / 1000
             )
 
-    # trace selection on an inline with a gap
+    # regional QC on an inline with a gap: bounds on the axis, gap excluded,
+    # curves are the mean of per-trace |rfft| of the traces really there
     line = next(
         il
         for il in inlines
@@ -185,22 +187,27 @@ def test_viewer_end_to_end(world):
     )
     section = viewer.load_section(job.id, LineOrientation.INLINE, line)
     truth = _by_coord(LineOrientation.INLINE, line)
-    present_xl = next(iter(truth))
-    missing_xl = next(xl for xl in crosslines if xl not in truth)
-
-    assert viewer.select_trace(job.id, section, float(missing_xl)) is None
-    view = viewer.select_trace(job.id, section, present_xl + 0.4)
-    assert view is not None
-    assert (view.geometry.inline, view.geometry.crossline) == (line, present_xl)
-    assert view.geometry.trace_index == truth[present_xl]
-    np.testing.assert_array_equal(view.original, amplitudes[truth[present_xl]])
+    region = SectionRegion.from_boundaries(crosslines[-1], crosslines[0])
+    regional = viewer.regional_spectrum(section, region, dataset, job)
+    inside = [truth[xl] for xl in crosslines if xl in truth]
+    assert regional.region.trace_indices == tuple(inside)
+    assert regional.n_positions == len(crosslines)
+    assert regional.n_present == len(inside)
+    assert regional.n_missing == len(crosslines) - len(inside)
     np.testing.assert_allclose(
-        view.filtered, expected_filtered[truth[present_xl]], rtol=1e-5
+        regional.spectrum.original,
+        np.abs(np.fft.rfft(amplitudes[inside], axis=-1)).mean(axis=0),
+        rtol=1e-5,
+    )
+    np.testing.assert_allclose(
+        regional.spectrum.filtered,
+        np.abs(np.fft.rfft(expected_filtered[inside], axis=-1)).mean(axis=0),
+        rtol=1e-4,
     )
 
     # spectrum: fs from the file's dt, up to Nyquist, cutoff from the job,
     # and the low-pass visibly attenuates above the cutoff
-    spectrum = viewer.spectrum(view)
+    spectrum = regional.spectrum
     fs = 1000 / dataset.sample_rate_ms
     assert spectrum.nyquist_hz == fs / 2
     assert spectrum.frequencies_hz[-1] == pytest.approx(fs / 2)

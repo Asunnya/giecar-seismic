@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -138,16 +140,6 @@ class SeismicSection:
         return position
 
 
-@dataclass(frozen=True)
-class TraceView:
-    geometry: TraceGeometry
-    time_ms: np.ndarray
-    original: np.ndarray
-    filtered: np.ndarray
-    dataset: SeismicDataset
-    job: Job
-
-
 class SpectrumScale(Enum):
     LINEAR = "Linear"
     DB = "dB"
@@ -237,48 +229,158 @@ def spectrum_for_display(
     )
 
 
+# Regional QC needs at least this many physically present traces; a region
+# of exactly one present trace IS the single-trace analysis.
+MIN_REGION_TRACES = 1
+# Rows per FFT batch while aggregating a region: temporary memory is
+# chunk x n_frequency_bins, whatever the region's size.
+REGION_SPECTRUM_CHUNK_TRACES = 64
+
+
+class RegionTooSmallError(ValueError):
+    """The region holds fewer than MIN_REGION_TRACES physical traces."""
+
+
 @dataclass(frozen=True)
-class AggregateSpectrum:
-    """Ensemble QC over a few traces of one loaded section.
+class SectionRegion:
+    """A contiguous, inclusive interval of the loaded section's axis
+    (crossline numbers on an inline, inline numbers on a crossline).
+    Normalized: lower <= upper, whatever the click order."""
+
+    lower_coordinate: int
+    upper_coordinate: int
+
+    def __post_init__(self) -> None:
+        if self.lower_coordinate > self.upper_coordinate:
+            raise ValueError("lower_coordinate must not exceed upper_coordinate")
+
+    @classmethod
+    def from_boundaries(cls, first: int, second: int) -> SectionRegion:
+        return cls(min(first, second), max(first, second))
+
+    def resolve(self, section: SeismicSection) -> ResolvedRegion:
+        """Which axis positions fall inside, and which of them carry a
+        physical trace. Both bounds must be actual axis coordinates (the
+        viewer snaps clicks to the axis); a bound may sit on a gap."""
+        coordinates = section.coordinates
+        for bound in (self.lower_coordinate, self.upper_coordinate):
+            if not np.any(coordinates == bound):
+                raise ValueError(f"coordinate {bound} is not on the section axis")
+        inside = np.flatnonzero(
+            (coordinates >= self.lower_coordinate)
+            & (coordinates <= self.upper_coordinate)
+        )
+        physical = section.physical_trace_indices[inside]
+        present = inside[physical >= 0]
+        return ResolvedRegion(
+            region=self,
+            orientation=section.orientation,
+            line_number=section.line_number,
+            positions=tuple(int(p) for p in inside),
+            present_positions=tuple(int(p) for p in present),
+            trace_indices=tuple(int(i) for i in physical[physical >= 0]),
+        )
+
+
+@dataclass(frozen=True)
+class ResolvedRegion:
+    """A SectionRegion projected onto one loaded section: axis positions
+    inside it, the subset that physically exists, and the gaps."""
+
+    region: SectionRegion
+    orientation: LineOrientation
+    line_number: int
+    positions: tuple[int, ...]
+    present_positions: tuple[int, ...]
+    trace_indices: tuple[int, ...]
+
+    @property
+    def n_positions(self) -> int:
+        return len(self.positions)
+
+    @property
+    def n_present(self) -> int:
+        return len(self.present_positions)
+
+    @property
+    def n_missing(self) -> int:
+        return self.n_positions - self.n_present
+
+    @property
+    def is_valid(self) -> bool:
+        return self.n_present >= MIN_REGION_TRACES
+
+    @property
+    def is_single_trace(self) -> bool:
+        return self.n_present == 1
+
+
+@dataclass(frozen=True)
+class TraceWaveform:
+    """Amplitude x time of ONE trace, original and filtered -- shown only
+    when the region is a single trace. A region is never averaged in the
+    time domain, so wider regions carry no waveform."""
+
+    trace_index: int
+    coordinate: int
+    time_ms: np.ndarray
+    original: np.ndarray
+    filtered: np.ndarray
+
+    @property
+    def amplitude_scale(self) -> float:
+        """One symmetric amplitude scale for the original/filtered overlay."""
+        values = np.abs(np.concatenate([self.original, self.filtered]))
+        return float(np.nanmax(values) or 1.0)
+
+
+@dataclass(frozen=True)
+class RegionalSpectrum:
+    """Ensemble QC over a region of one loaded section.
 
     `spectrum.original` / `spectrum.filtered` are, per frequency bin, the
-    arithmetic mean of the per-trace linear amplitude spectra
-    (TRACE -> FFT -> |.| -> mean), never the spectrum of the averaged traces:
-    time-domain averaging lets neighbouring traces cancel by phase and
-    misrepresents the frequency content. Reusing TraceSpectrum as the array
-    container is what gives this the exact same Linear/dB rules and
-    renderers as a single trace; it is not a TraceView and has no geometry
-    of its own beyond the selected identities.
+    arithmetic mean of the per-trace linear amplitude spectra of every
+    physically present trace in the region (TRACE -> FFT -> |.| -> mean),
+    never the spectrum of the averaged traces: time-domain averaging lets
+    neighbouring traces cancel by phase and misrepresents the frequency
+    content. TraceSpectrum is reused as the array container so the same
+    Linear/dB rules and renderers apply.
     """
 
     METHOD = "Mean of per-trace amplitude spectra"
 
     spectrum: TraceSpectrum
-    trace_indices: tuple[int, ...]  # physical, in selection order
-    coordinates: tuple[int, ...]  # axis coordinate of each selected trace
-    orientation: LineOrientation
-    line_number: int
+    region: ResolvedRegion
     dataset: SeismicDataset
     job: Job
+    waveform: TraceWaveform | None = None  # only for a single-trace region
 
     @property
-    def n_traces(self) -> int:
-        return len(self.trace_indices)
+    def n_present(self) -> int:
+        return self.region.n_present
+
+    @property
+    def n_missing(self) -> int:
+        return self.region.n_missing
+
+    @property
+    def n_positions(self) -> int:
+        return self.region.n_positions
 
 
-def aggregate_for_display(
-    aggregate: AggregateSpectrum,
+def regional_spectrum_for_display(
+    regional: RegionalSpectrum,
     scale: SpectrumScale,
     *,
     show_filter_response: bool = False,
-) -> AggregateSpectrum:
-    """Same Linear/dB transform as a single trace, applied to the already
+) -> RegionalSpectrum:
+    """Same Linear/dB transform as any spectrum, applied to the already
     aggregated linear magnitudes (dB after aggregation, never a mean of
-    dB values). No FFT; the raw aggregate is never mutated."""
+    dB values). No FFT; the raw regional spectrum is never mutated."""
     return replace(
-        aggregate,
+        regional,
         spectrum=spectrum_for_display(
-            aggregate.spectrum, scale, show_filter_response=show_filter_response
+            regional.spectrum, scale, show_filter_response=show_filter_response
         ),
     )
 
@@ -429,80 +531,62 @@ class SeismicViewerService:
         finally:
             reader.close()
 
-    def select_trace(
-        self, target: ViewerTarget, section: SeismicSection, coordinate: float
-    ) -> TraceView | None:
-        """Snap a clicked coordinate to the nearest axis position. If that
-        position has no physical trace (a gap), return None explicitly --
-        never silently the next neighbour."""
-        position = section.position_for_coordinate(coordinate)
-        if position is None:
-            return None  # clicked outside the axis
-        trace_index = int(section.physical_trace_indices[position])
-        if trace_index < 0:
-            return None
-        ctx = self.context(target)
-        assert ctx.dataset.id is not None
-        geometry = self._geometry.get_trace(ctx.dataset.id, trace_index)
-        if geometry is None:
-            return None
-        return TraceView(
-            geometry=geometry,
-            time_ms=section.time_ms,
-            original=section.original[position],
-            filtered=section.filtered[position],
-            dataset=ctx.dataset,
-            job=ctx.job,
-        )
-
     @staticmethod
-    def spectrum(view: TraceView) -> TraceSpectrum:
-        return _linear_spectrum(
-            np.abs(np.fft.rfft(view.original)),
-            np.abs(np.fft.rfft(view.filtered)),
-            n_samples=view.original.shape[0],
-            dataset=view.dataset,
-            job=view.job,
-        )
-
-    @staticmethod
-    def aggregate_spectrum(
+    def regional_spectrum(
         section: SeismicSection,
-        trace_indices: Sequence[int],
+        region: SectionRegion,
         dataset: SeismicDataset,
         job: Job,
-    ) -> AggregateSpectrum:
-        """Mean of per-trace amplitude spectra for `trace_indices` (physical
-        identities present in `section`). Reads only the section's rows for
-        those traces -- no I/O, memory bounded by len(trace_indices) spectra.
-        """
-        indices = [int(i) for i in trace_indices]
-        if not indices:
-            raise ValueError("aggregate_spectrum needs at least one trace")
-        if len(set(indices)) != len(indices):
-            raise ValueError(f"duplicate trace indices in {indices}")
-        positions = []
-        for index in indices:
-            matches = np.flatnonzero(section.physical_trace_indices == index)
-            if index < 0 or matches.size == 0:
-                raise ValueError(f"trace {index} is not in the section")
-            positions.append(int(matches[0]))
-        original = np.abs(np.fft.rfft(section.original[positions], axis=-1))
-        filtered = np.abs(np.fft.rfft(section.filtered[positions], axis=-1))
-        return AggregateSpectrum(
+        *,
+        chunk_traces: int = REGION_SPECTRUM_CHUNK_TRACES,
+    ) -> RegionalSpectrum:
+        """Mean of per-trace amplitude spectra over the physically present
+        traces of `region`. Reads only the section's rows for those traces
+        (no I/O) in batches of `chunk_traces`, accumulating per-bin sums:
+        temporary memory is chunk x bins, not region x bins."""
+        if chunk_traces < 1:
+            raise ValueError("chunk_traces must be at least 1")
+        resolved = region.resolve(section)
+        if not resolved.is_valid:
+            raise RegionTooSmallError(
+                f"region must contain at least {MIN_REGION_TRACES} trace, "
+                f"found {resolved.n_present}"
+            )
+        rows = list(resolved.present_positions)
+        n_bins = section.n_samples // 2 + 1
+        sum_original = np.zeros(n_bins, dtype=np.float64)
+        sum_filtered = np.zeros(n_bins, dtype=np.float64)
+        for start in range(0, len(rows), chunk_traces):
+            batch = rows[start : start + chunk_traces]
+            sum_original += np.abs(np.fft.rfft(section.original[batch], axis=-1)).sum(
+                axis=0
+            )
+            sum_filtered += np.abs(np.fft.rfft(section.filtered[batch], axis=-1)).sum(
+                axis=0
+            )
+        count = len(rows)
+        waveform = None
+        if resolved.is_single_trace:
+            row = rows[0]
+            waveform = TraceWaveform(
+                trace_index=resolved.trace_indices[0],
+                coordinate=int(section.coordinates[row]),
+                time_ms=section.time_ms,
+                original=np.array(section.original[row]),
+                filtered=np.array(section.filtered[row]),
+            )
+        return RegionalSpectrum(
             spectrum=_linear_spectrum(
-                original.mean(axis=0),
-                filtered.mean(axis=0),
+                sum_original / count,
+                sum_filtered / count,
                 n_samples=section.n_samples,
                 dataset=dataset,
                 job=job,
             ),
-            trace_indices=tuple(indices),
-            coordinates=tuple(int(section.coordinates[p]) for p in positions),
-            orientation=section.orientation,
-            line_number=section.line_number,
+            region=resolved,
             dataset=dataset,
             job=job,
+            waveform=waveform,
         )
 
 
@@ -514,9 +598,9 @@ def _linear_spectrum(
     dataset: SeismicDataset,
     job: Job,
 ) -> TraceSpectrum:
-    """Shared tail of the single-trace and aggregate paths: the rfft
-    frequency axis and ONE theoretical zero-phase response from the job's
-    SOS (|H|^2), whatever the number of traces behind the magnitudes."""
+    """The rfft frequency axis and ONE theoretical zero-phase response
+    from the job's SOS (|H|^2), whatever the number of traces behind the
+    magnitudes."""
     fs_hz = 1000 / dataset.sample_rate_ms
     frequencies = np.fft.rfftfreq(n_samples, d=1 / fs_hz)
     sos = butterworth_sos(

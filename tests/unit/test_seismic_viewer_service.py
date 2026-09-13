@@ -16,6 +16,8 @@ from giecar_seismic.application.butterworth_filter import apply_butterworth_filt
 from giecar_seismic.application.filter_jobs import InvalidFilterParametersError
 from giecar_seismic.application.seismic_viewer import (
     FilterPreview,
+    RegionTooSmallError,
+    SectionRegion,
     SectionTooLargeError,
     SeismicSection,
     SeismicViewerService,
@@ -225,73 +227,47 @@ def test_only_completed_jobs_with_an_output_are_viewable(world, job):
         service.load_section(7, LineOrientation.INLINE, 10)
 
 
-# --- trace selection ---------------------------------------------------------
+# --- regional QC on a loaded section (no further reads) --------------------------
 
 
-def test_selecting_a_coordinate_resolves_the_nearest_existing_trace(world):
-    service, original, filtered, _ = world
-    section = service.load_section(7, LineOrientation.INLINE, 12)
+def test_regional_spectrum_uses_only_the_loaded_section_rows(world):
+    service, original, filtered, readers = world
+    section = service.load_section(7, LineOrientation.INLINE, 11)  # (11, 3) missing
+    reads_before = (len(readers["original"]), len(readers["filtered"]))
 
-    view = service.select_trace(7, section, coordinate=2.3)  # nearest xl=2
+    regional = service.regional_spectrum(
+        section, SectionRegion.from_boundaries(3, 1), _dataset(), _job()
+    )
 
-    assert view is not None
-    assert view.geometry == TraceGeometry(6, 12, 2)
-    assert view.dataset.id == 1 and view.job.id == 7
-    np.testing.assert_array_equal(view.original, original[6])
-    np.testing.assert_array_equal(view.filtered, filtered[6])
-    np.testing.assert_allclose(view.time_ms, np.arange(N_SAMPLES) * SAMPLE_RATE_MS)
-
-
-def test_selecting_a_missing_position_does_not_invent_a_trace(world):
-    service, *_ = world
-    section = service.load_section(7, LineOrientation.INLINE, 11)
-
-    assert service.select_trace(7, section, coordinate=3.0) is None  # (11,3) absent
-    assert service.select_trace(7, section, coordinate=2.0) is not None
-
-
-def test_selecting_outside_the_axis_returns_none(world):
-    service, *_ = world
-    section = service.load_section(7, LineOrientation.INLINE, 10)
-
-    assert service.select_trace(7, section, coordinate=42.0) is None
-
-
-# --- spectrum ---------------------------------------------------------------
-
-
-def test_spectrum_uses_fs_from_sample_rate_and_stops_at_nyquist(world):
-    service, *_ = world
-    section = service.load_section(7, LineOrientation.INLINE, 10)
-    view = service.select_trace(7, section, coordinate=1.0)
-    assert view is not None
-
-    spectrum = service.spectrum(view)
-
+    assert (len(readers["original"]), len(readers["filtered"])) == reads_before
+    assert regional.region.trace_indices == (3, 4)
+    assert (regional.n_positions, regional.n_present, regional.n_missing) == (3, 2, 1)
+    np.testing.assert_allclose(
+        regional.spectrum.original,
+        np.abs(np.fft.rfft(original[[3, 4]], axis=-1)).mean(axis=0),
+        rtol=1e-5,
+    )
+    np.testing.assert_allclose(
+        regional.spectrum.filtered,
+        np.abs(np.fft.rfft(filtered[[3, 4]], axis=-1)).mean(axis=0),
+        rtol=1e-5,
+    )
     fs = 1000 / SAMPLE_RATE_MS
-    assert spectrum.nyquist_hz == fs / 2 == 125.0
-    assert spectrum.frequencies_hz[0] == 0
-    assert spectrum.frequencies_hz[-1] == pytest.approx(spectrum.nyquist_hz)
-    assert (
-        spectrum.frequencies_hz.shape
-        == spectrum.original.shape
-        == spectrum.filtered.shape
-    )
+    assert regional.spectrum.nyquist_hz == fs / 2 == 125.0
+    assert regional.spectrum.cutoff_hz == 30.0  # the job's, for presentation
+
+
+def test_regional_spectrum_accepts_a_single_trace_but_not_an_empty_region(world):
+    service, original, *_ = world
+    section = service.load_section(7, LineOrientation.INLINE, 11)  # (11, 3) missing
+
+    single = service.regional_spectrum(section, SectionRegion(2, 3), _dataset(), _job())
+    assert single.region.is_single_trace and single.region.trace_indices == (4,)
     np.testing.assert_allclose(
-        spectrum.original, np.abs(np.fft.rfft(view.original)), rtol=1e-5
+        single.spectrum.original, np.abs(np.fft.rfft(original[4])), rtol=1e-5
     )
-    np.testing.assert_allclose(
-        spectrum.filtered, np.abs(np.fft.rfft(view.filtered)), rtol=1e-5
-    )
-
-
-def test_spectrum_carries_the_jobs_cutoff_for_presentation(world):
-    service, *_ = world
-    section = service.load_section(7, LineOrientation.INLINE, 10)
-    view = service.select_trace(7, section, coordinate=1.0)
-    assert view is not None
-
-    assert service.spectrum(view).cutoff_hz == 30.0
+    with pytest.raises(RegionTooSmallError):
+        service.regional_spectrum(section, SectionRegion(3, 3), _dataset(), _job())
 
 
 def test_section_is_a_plain_value_object_without_qt_or_matplotlib():
@@ -404,18 +380,20 @@ def test_preview_section_keeps_gaps_as_nan(world):
     assert np.isfinite(section.filtered[:2]).all()
 
 
-def test_preview_trace_selection_and_spectrum_carry_the_preview_parameters(world):
+def test_preview_regional_spectrum_carries_the_preview_parameters(world):
     service, *_ = world
     preview = _preview(
         filter_type=FilterType.BAND_PASS, cutoff_hz=20.0, upper_cutoff_hz=50.0
     )
+    ctx = service.context(preview)
     section = service.load_section(preview, LineOrientation.INLINE, 10)
 
-    view = service.select_trace(preview, section, coordinate=2.0)
+    regional = service.regional_spectrum(
+        section, SectionRegion(1, 3), ctx.dataset, ctx.job
+    )
 
-    assert view is not None
-    assert view.job.id is None
-    assert view.geometry.trace_index == 1
-    spectrum = service.spectrum(view)
+    assert regional.job.id is None  # the unpersisted preview job
+    assert regional.region.trace_indices == (0, 1, 2)
+    spectrum = regional.spectrum
     assert [m.frequency_hz for m in spectrum.cutoff_markers] == [20.0, 50.0]
     assert spectrum.filter_response is not None
